@@ -1,0 +1,2758 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import sqlite3
+import json
+import requests
+import threading
+import time
+from datetime import datetime
+import os
+from decimal import Decimal, ROUND_HALF_UP
+import uuid
+
+# Configuración
+EXCHANGE_CONFIG = {
+    "default_rate": 36.50,
+    "auto_update_interval": 3600,  # 1 hora en segundos
+    "api_url": "https://pydolarve.org/api/v1/dollar?page=bcv&monitor=usd",
+    "request_timeout": 10
+}
+
+DATABASE_FILE = "pos_database.db"
+BACKUP_FILE = "daily_backup.json"
+
+class StyleManager:
+    def __init__(self):
+        self.colors = {
+            "bg_primary": "#2c3e50",
+            "bg_secondary": "#34495e", 
+            "bg_card": "#ecf0f1",
+            "accent": "#3498db",
+            "success": "#27ae60",
+            "warning": "#f39c12",
+            "danger": "#e74c3c",
+            "text_primary": "#ffffff",
+            "text_secondary": "#7f8c8d",
+            "text_light": "#ffffff"
+        }
+        
+        self.fonts = {
+            "title": ("Helvetica", 18, "bold"),
+            "subtitle": ("Helvetica", 14, "bold"),
+            "large": ("Helvetica", 16, "bold"),
+            "normal": ("Segoe UI", 12),
+            "small": ("Segoe UI", 10)
+        }
+
+class DatabaseManager:
+    def __init__(self):
+        self.db_file = DATABASE_FILE
+        self.init_database()
+    
+    def init_database(self):
+        """Inicializa la base de datos"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # Tabla de productos
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price_usd REAL NOT NULL,
+                stock INTEGER NOT NULL DEFAULT 0,
+                profit_percentage REAL DEFAULT 0
+            )
+        ''')
+        
+        # Tabla de ventas
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sales (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                total_usd REAL NOT NULL,
+                total_ves REAL NOT NULL,
+                payment_method TEXT NOT NULL,
+                usd_received REAL DEFAULT 0,
+                ves_received REAL DEFAULT 0,
+                usd_change REAL DEFAULT 0,
+                ves_change REAL DEFAULT 0,
+                exchange_rate REAL NOT NULL,
+                items TEXT NOT NULL,
+                discount_percentage REAL DEFAULT 0
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def add_product(self, name, price_usd, stock, profit_percentage=0):
+        """Agrega un producto"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO products (name, price_usd, stock, profit_percentage)
+            VALUES (?, ?, ?, ?)
+        ''', (name, price_usd, stock, profit_percentage))
+        conn.commit()
+        conn.close()
+    
+    def get_products(self, search_term=""):
+        """Obtiene productos con búsqueda opcional"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        if search_term:
+            cursor.execute('''
+                SELECT * FROM products 
+                WHERE name LIKE ? OR id LIKE ?
+                ORDER BY name
+            ''', (f'%{search_term}%', f'%{search_term}%'))
+        else:
+            cursor.execute('SELECT * FROM products ORDER BY name')
+        
+        products = cursor.fetchall()
+        conn.close()
+        return products
+    
+    def update_stock(self, product_id, quantity_sold):
+        """Actualiza el stock de un producto"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE products SET stock = stock - ? WHERE id = ?
+        ''', (quantity_sold, product_id))
+        conn.commit()
+        conn.close()
+    
+    def save_sale(self, sale_data):
+        """Guarda una venta"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO sales (id, timestamp, total_usd, total_ves, payment_method,
+                             usd_received, ves_received, usd_change, ves_change,
+                             exchange_rate, items, discount_percentage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            sale_data['id'], sale_data['timestamp'], sale_data['total_usd'],
+            sale_data['total_ves'], sale_data['payment_method'],
+            sale_data['usd_received'], sale_data['ves_received'],
+            sale_data['usd_change'], sale_data['ves_change'],
+            sale_data['exchange_rate'], json.dumps(sale_data['items']),
+            sale_data['discount_percentage']
+        ))
+        conn.commit()
+        conn.close()
+    
+    def get_daily_sales(self, date=None):
+        """Obtiene las ventas del día"""
+        if date is None:
+            date = datetime.datetime.now().strftime('%Y-%m-%d')
+        
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM sales 
+            WHERE date(timestamp) = ?
+            ORDER BY timestamp
+        ''', (date,))
+        
+        sales = cursor.fetchall()
+        conn.close()
+        return sales
+
+class SalesManager:
+    def __init__(self, data_file="data/sales.json"):
+        self.data_file = data_file
+        self.sales = {}
+        self.next_id = 1
+        self.load_sales()
+    
+    def load_sales(self):
+        """Carga las ventas desde el archivo"""
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.sales = data.get('sales', {})
+                    self.next_id = data.get('next_id', 1)
+                    
+                    # Convertir IDs de string a int si es necesario
+                    if self.sales:
+                        converted_sales = {}
+                        for key, value in self.sales.items():
+                            converted_sales[int(key)] = value
+                        self.sales = converted_sales
+            else:
+                self.sales = {}
+                self.next_id = 1
+                
+        except Exception as e:
+            print(f"Error cargando ventas: {e}")
+            self.sales = {}
+            self.next_id = 1
+    
+    def save_sales(self):
+        """Guarda las ventas en el archivo"""
+        try:
+            # Crear directorio si no existe
+            os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+            
+            # Convertir IDs a string para JSON
+            sales_for_json = {}
+            for key, value in self.sales.items():
+                sales_for_json[str(key)] = value
+            
+            data = {
+                'sales': sales_for_json,
+                'next_id': self.next_id
+            }
+            
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"Error guardando ventas: {e}")
+    
+    def record_sale(self, sale_data):
+        """Registra una nueva venta"""
+        try:
+            sale_id = self.next_id
+            
+            # Validar datos de la venta
+            if not sale_data.get('items') or not isinstance(sale_data['items'], list):
+                raise ValueError("La venta debe tener al menos un producto")
+            
+            if not isinstance(sale_data.get('total'), (int, float)) or sale_data['total'] <= 0:
+                raise ValueError("El total de la venta debe ser un número positivo")
+            
+            # Crear registro de venta
+            sale_record = {
+                'id': sale_id,
+                'timestamp': datetime.now().isoformat(),
+                'items': sale_data['items'],
+                'subtotal': float(sale_data.get('subtotal', sale_data['total'])),
+                'discount_percentage': float(sale_data.get('discount_percentage', 0)),
+                'total': float(sale_data['total']),
+                'payment_info': sale_data.get('payment_info', {}),
+                'exchange_rate': float(sale_data.get('exchange_rate', 36.0)),
+                'status': 'completed'
+            }
+            
+            # Calcular estadísticas adicionales
+            sale_record['total_items'] = sum(item['quantity'] for item in sale_data['items'])
+            sale_record['unique_products'] = len(sale_data['items'])
+            
+            # Agregar información de descuento si aplica
+            if sale_record['discount_percentage'] > 0:
+                discount_amount = sale_record['subtotal'] * (sale_record['discount_percentage'] / 100)
+                sale_record['discount_amount'] = discount_amount
+            
+            # Guardar la venta
+            self.sales[sale_id] = sale_record
+            self.next_id += 1
+            
+            # Guardar en archivo
+            self.save_sales()
+            
+            return sale_id
+            
+        except Exception as e:
+            print(f"Error registrando venta: {e}")
+            return None
+    
+    def get_sale(self, sale_id):
+        """Obtiene una venta por su ID"""
+        return self.sales.get(sale_id)
+    
+    def get_all_sales(self):
+        """Obtiene todas las ventas como lista"""
+        return list(self.sales.values())
+    
+    def get_sales_by_date_range(self, start_date, end_date):
+        """Obtiene ventas en un rango de fechas"""
+        try:
+            if isinstance(start_date, str):
+                start_date = datetime.fromisoformat(start_date)
+            if isinstance(end_date, str):
+                end_date = datetime.fromisoformat(end_date)
+            
+            filtered_sales = []
+            
+            for sale in self.sales.values():
+                sale_date = datetime.fromisoformat(sale['timestamp'])
+                if start_date <= sale_date <= end_date:
+                    filtered_sales.append(sale)
+            
+            return filtered_sales
+            
+        except Exception as e:
+            print(f"Error filtrando ventas por fecha: {e}")
+            return []
+    
+    def get_today_sales(self):
+        """Obtiene las ventas del día actual"""
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        return self.get_sales_by_date_range(today, tomorrow)
+    
+    def get_week_sales(self):
+        """Obtiene las ventas de la semana actual"""
+        from datetime import timedelta
+        
+        today = datetime.now()
+        start_of_week = today - timedelta(days=today.weekday())
+        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_week = start_of_week + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        
+        return self.get_sales_by_date_range(start_of_week, end_of_week)
+    
+    def get_month_sales(self):
+        """Obtiene las ventas del mes actual"""
+        today = datetime.now()
+        start_of_month = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        # Último día del mes
+        if today.month == 12:
+            end_of_month = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
+        else:
+            end_of_month = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
+        
+        end_of_month = end_of_month.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        return self.get_sales_by_date_range(start_of_month, end_of_month)
+    
+    def get_sales_summary(self, sales_list=None):
+        """Obtiene un resumen de ventas"""
+        if sales_list is None:
+            sales_list = list(self.sales.values())
+        
+        if not sales_list:
+            return {
+                'total_sales': 0,
+                'total_revenue_usd': 0.0,
+                'total_revenue_ves': 0.0,
+                'total_items_sold': 0,
+                'average_sale_value': 0.0,
+                'payment_methods': {},
+                'top_products': []
+            }
+        
+        # Calcular estadísticas básicas
+        total_sales = len(sales_list)
+        total_revenue_usd = sum(sale['total'] for sale in sales_list)
+        total_items_sold = sum(sale.get('total_items', 0) for sale in sales_list)
+        average_sale_value = total_revenue_usd / total_sales if total_sales > 0 else 0
+        
+        # Calcular revenue en VES (usando la tasa promedio)
+        total_revenue_ves = 0
+        for sale in sales_list:
+            exchange_rate = sale.get('exchange_rate', 36.0)
+            total_revenue_ves += sale['total'] * exchange_rate
+        
+        # Métodos de pago
+        payment_methods = {}
+        for sale in sales_list:
+            method = sale.get('payment_info', {}).get('method', 'USD')
+            payment_methods[method] = payment_methods.get(method, 0) + 1
+        
+        # Productos más vendidos
+        product_sales = {}
+        for sale in sales_list:
+            for item in sale.get('items', []):
+                product_name = item['name']
+                quantity = item['quantity']
+                
+                if product_name in product_sales:
+                    product_sales[product_name]['quantity'] += quantity
+                    product_sales[product_name]['revenue'] += item['total_price']
+                else:
+                    product_sales[product_name] = {
+                        'quantity': quantity,
+                        'revenue': item['total_price']
+                    }
+        
+        # Top 5 productos más vendidos
+        top_products = sorted(
+            product_sales.items(),
+            key=lambda x: x[1]['quantity'],
+            reverse=True
+        )[:5]
+        
+        return {
+            'total_sales': total_sales,
+            'total_revenue_usd': total_revenue_usd,
+            'total_revenue_ves': total_revenue_ves,
+            'total_items_sold': total_items_sold,
+            'average_sale_value': average_sale_value,
+            'payment_methods': payment_methods,
+            'top_products': top_products
+        }
+    
+    def get_daily_summary(self):
+        """Obtiene resumen de ventas diarias"""
+        return self.get_sales_summary(self.get_today_sales())
+    
+    def get_weekly_summary(self):
+        """Obtiene resumen de ventas semanales"""
+        return self.get_sales_summary(self.get_week_sales())
+    
+    def get_monthly_summary(self):
+        """Obtiene resumen de ventas mensuales"""
+        return self.get_sales_summary(self.get_month_sales())
+    
+    def cancel_sale(self, sale_id, reason=""):
+        """Cancela una venta (marca como cancelada)"""
+        try:
+            if sale_id not in self.sales:
+                raise ValueError(f"Venta con ID {sale_id} no encontrada")
+            
+            sale = self.sales[sale_id]
+            
+            if sale.get('status') == 'cancelled':
+                raise ValueError("La venta ya está cancelada")
+            
+            # Marcar como cancelada
+            sale['status'] = 'cancelled'
+            sale['cancelled_at'] = datetime.now().isoformat()
+            sale['cancellation_reason'] = reason
+            
+            # Guardar cambios
+            self.save_sales()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error cancelando venta: {e}")
+            return False
+    
+    def search_sales(self, search_term):
+        """Busca ventas por ID o productos"""
+        search_term = str(search_term).lower().strip()
+        results = []
+        
+        for sale in self.sales.values():
+            # Buscar por ID
+            if search_term in str(sale['id']):
+                results.append(sale)
+                continue
+            
+            # Buscar por productos
+            for item in sale.get('items', []):
+                if search_term in item['name'].lower():
+                    results.append(sale)
+                    break
+        
+        return results
+    
+    def export_sales(self, filename=None, start_date=None, end_date=None):
+        """Exporta las ventas a un archivo CSV"""
+        try:
+            if not filename:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"data/sales_export_{timestamp}.csv"
+            
+            # Filtrar ventas si se especifican fechas
+            if start_date and end_date:
+                sales_to_export = self.get_sales_by_date_range(start_date, end_date)
+            else:
+                sales_to_export = list(self.sales.values())
+            
+            import csv
+            
+            # Crear directorio si no existe
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = [
+                    'ID', 'Fecha', 'Hora', 'Subtotal USD', 'Descuento %', 
+                    'Total USD', 'Total VES', 'Método Pago', 'Items', 'Estado'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for sale in sales_to_export:
+                    sale_date = datetime.fromisoformat(sale['timestamp'])
+                    total_ves = sale['total'] * sale.get('exchange_rate', 36.0)
+                    
+                    writer.writerow({
+                        'ID': sale['id'],
+                        'Fecha': sale_date.strftime('%d/%m/%Y'),
+                        'Hora': sale_date.strftime('%H:%M:%S'),
+                        'Subtotal USD': f"${sale['subtotal']:.2f}",
+                        'Descuento %': f"{sale.get('discount_percentage', 0):.1f}%",
+                        'Total USD': f"${sale['total']:.2f}",
+                        'Total VES': f"Bs. {total_ves:,.2f}",
+                        'Método Pago': sale.get('payment_info', {}).get('method', 'USD'),
+                        'Items': sale.get('total_items', 0),
+                        'Estado': sale.get('status', 'completed')
+                    })
+            
+            return filename
+            
+        except Exception as e:
+            print(f"Error exportando ventas: {e}")
+            return None
+    
+    def backup_sales(self):
+        """Crea una copia de seguridad de las ventas"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"data/sales_backup_{timestamp}.json"
+            
+            # Crear directorio si no existe
+            os.makedirs(os.path.dirname(backup_filename), exist_ok=True)
+            
+            # Copiar archivo actual
+            import shutil
+            if os.path.exists(self.data_file):
+                shutil.copy2(self.data_file, backup_filename)
+                return backup_filename
+            
+        except Exception as e:
+            print(f"Error creando backup de ventas: {e}")
+            return None
+    
+    def get_best_selling_products(self, limit=10, period_days=30):
+        """Obtiene los productos más vendidos en un período"""
+        try:
+            from datetime import timedelta
+            
+            # Calcular fecha de inicio
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=period_days)
+            
+            # Obtener ventas del período
+            period_sales = self.get_sales_by_date_range(start_date, end_date)
+            
+            # Contar productos vendidos
+            product_stats = {}
+            
+            for sale in period_sales:
+                for item in sale.get('items', []):
+                    product_name = item['name']
+                    quantity = item['quantity']
+                    revenue = item['total_price']
+                    
+                    if product_name in product_stats:
+                        product_stats[product_name]['quantity_sold'] += quantity
+                        product_stats[product_name]['total_revenue'] += revenue
+                        product_stats[product_name]['times_sold'] += 1
+                    else:
+                        product_stats[product_name] = {
+                            'product_name': product_name,
+                            'quantity_sold': quantity,
+                            'total_revenue': revenue,
+                            'times_sold': 1,
+                            'average_price': item['unit_price']
+                        }
+            
+            # Ordenar por cantidad vendida
+            best_sellers = sorted(
+                product_stats.values(),
+                key=lambda x: x['quantity_sold'],
+                reverse=True
+            )[:limit]
+            
+            return best_sellers
+            
+        except Exception as e:
+            print(f"Error obteniendo productos más vendidos: {e}")
+            return []
+    
+    def get_sales_by_payment_method(self, method):
+        """Obtiene ventas filtradas por método de pago"""
+        filtered_sales = []
+        
+        for sale in self.sales.values():
+            payment_method = sale.get('payment_info', {}).get('method', 'USD')
+            if payment_method.upper() == method.upper():
+                filtered_sales.append(sale)
+        
+        return filtered_sales
+    
+    def get_revenue_by_period(self, period='daily', num_periods=7):
+        """Obtiene ingresos agrupados por período"""
+        try:
+            from datetime import timedelta
+            import calendar
+            
+            revenue_data = []
+            current_date = datetime.now()
+            
+            for i in range(num_periods):
+                if period == 'daily':
+                    period_start = current_date - timedelta(days=i)
+                    period_end = period_start.replace(hour=23, minute=59, second=59)
+                    period_start = period_start.replace(hour=0, minute=0, second=0)
+                    period_label = period_start.strftime('%d/%m')
+                    
+                elif period == 'weekly':
+                    days_since_monday = current_date.weekday()
+                    week_start = current_date - timedelta(days=days_since_monday + (i * 7))
+                    period_start = week_start.replace(hour=0, minute=0, second=0)
+                    period_end = period_start + timedelta(days=6, hours=23, minutes=59, seconds=59)
+                    period_label = f"Sem {period_start.strftime('%d/%m')}"
+                    
+                elif period == 'monthly':
+                    if i == 0:
+                        period_start = current_date.replace(day=1, hour=0, minute=0, second=0)
+                    else:
+                        year = current_date.year
+                        month = current_date.month - i
+                        if month <= 0:
+                            month += 12
+                            year -= 1
+                        period_start = datetime(year, month, 1)
+                    
+                    # Último día del mes
+                    last_day = calendar.monthrange(period_start.year, period_start.month)[1]
+                    period_end = period_start.replace(day=last_day, hour=23, minute=59, second=59)
+                    period_label = period_start.strftime('%m/%Y')
+                
+                # Obtener ventas del período
+                period_sales = self.get_sales_by_date_range(period_start, period_end)
+                period_revenue = sum(sale['total'] for sale in period_sales)
+                
+                revenue_data.append({
+                    'period': period_label,
+                    'start_date': period_start,
+                    'end_date': period_end,
+                    'revenue_usd': period_revenue,
+                    'sales_count': len(period_sales)
+                })
+            
+            return list(reversed(revenue_data))  # Orden cronológico
+            
+        except Exception as e:
+            print(f"Error obteniendo ingresos por período: {e}")
+            return []
+    
+    def get_hourly_sales_pattern(self, days_back=7):
+        """Obtiene el patrón de ventas por horas del día"""
+        try:
+            from datetime import timedelta
+            
+            # Obtener ventas de los últimos días
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=days_back)
+            recent_sales = self.get_sales_by_date_range(start_date, end_date)
+            
+            # Agrupar por hora
+            hourly_data = {hour: {'sales_count': 0, 'revenue': 0.0} for hour in range(24)}
+            
+            for sale in recent_sales:
+                sale_time = datetime.fromisoformat(sale['timestamp'])
+                hour = sale_time.hour
+                
+                hourly_data[hour]['sales_count'] += 1
+                hourly_data[hour]['revenue'] += sale['total']
+            
+            return hourly_data
+            
+        except Exception as e:
+            print(f"Error obteniendo patrón horario: {e}")
+            return {}
+    
+    def get_customer_analytics(self):
+        """Obtiene análisis básico de clientes (basado en patrones de compra)"""
+        try:
+            all_sales = list(self.sales.values())
+            
+            if not all_sales:
+                return {
+                    'total_transactions': 0,
+                    'average_transaction_value': 0,
+                    'transaction_ranges': {}
+                }
+            
+            # Rangos de transacciones
+            ranges = {
+                'small': {'min': 0, 'max': 10, 'count': 0},      # $0-10
+                'medium': {'min': 10, 'max': 50, 'count': 0},    # $10-50
+                'large': {'min': 50, 'max': 100, 'count': 0},    # $50-100
+                'xlarge': {'min': 100, 'max': float('inf'), 'count': 0}  # $100+
+            }
+            
+            total_transactions = len(all_sales)
+            total_value = sum(sale['total'] for sale in all_sales)
+            average_value = total_value / total_transactions
+            
+            # Clasificar transacciones por rango
+            for sale in all_sales:
+                total = sale['total']
+                
+                if total < 10:
+                    ranges['small']['count'] += 1
+                elif total < 50:
+                    ranges['medium']['count'] += 1
+                elif total < 100:
+                    ranges['large']['count'] += 1
+                else:
+                    ranges['xlarge']['count'] += 1
+            
+            return {
+                'total_transactions': total_transactions,
+                'average_transaction_value': average_value,
+                'total_revenue': total_value,
+                'transaction_ranges': ranges
+            }
+            
+        except Exception as e:
+            print(f"Error en análisis de clientes: {e}")
+            return {}
+    
+    def get_detailed_sale_report(self, sale_id):
+        """Obtiene un reporte detallado de una venta específica"""
+        try:
+            sale = self.get_sale(sale_id)
+            if not sale:
+                return None
+            
+            # Información básica
+            sale_time = datetime.fromisoformat(sale['timestamp'])
+            
+            report = {
+                'basic_info': {
+                    'id': sale['id'],
+                    'date': sale_time.strftime('%d/%m/%Y'),
+                    'time': sale_time.strftime('%H:%M:%S'),
+                    'status': sale.get('status', 'completed')
+                },
+                'financial_info': {
+                    'subtotal': sale['subtotal'],
+                    'discount_percentage': sale.get('discount_percentage', 0),
+                    'discount_amount': sale.get('discount_amount', 0),
+                    'total_usd': sale['total'],
+                    'exchange_rate': sale.get('exchange_rate', 36.0),
+                    'total_ves': sale['total'] * sale.get('exchange_rate', 36.0)
+                },
+                'payment_info': sale.get('payment_info', {}),
+                'items_detail': sale.get('items', []),
+                'summary': {
+                    'total_items': sale.get('total_items', 0),
+                    'unique_products': sale.get('unique_products', 0)
+                }
+            }
+            
+            # Información de cancelación si aplica
+            if sale.get('status') == 'cancelled':
+                report['cancellation_info'] = {
+                    'cancelled_at': sale.get('cancelled_at'),
+                    'reason': sale.get('cancellation_reason', '')
+                }
+            
+            return report
+            
+        except Exception as e:
+            print(f"Error generando reporte detallado: {e}")
+            return None
+    
+    def cleanup_old_sales(self, days_to_keep=365):
+        """Limpia ventas antiguas (opcional, para mantenimiento)"""
+        try:
+            from datetime import timedelta
+            
+            cutoff_date = datetime.now() - timedelta(days=days_to_keep)
+            sales_to_remove = []
+            
+            for sale_id, sale in self.sales.items():
+                sale_date = datetime.fromisoformat(sale['timestamp'])
+                if sale_date < cutoff_date:
+                    sales_to_remove.append(sale_id)
+            
+            # Crear backup antes de limpiar
+            if sales_to_remove:
+                backup_file = self.backup_sales()
+                
+                # Remover ventas antiguas
+                for sale_id in sales_to_remove:
+                    del self.sales[sale_id]
+                
+                # Guardar cambios
+                self.save_sales()
+                
+                return {
+                    'removed_count': len(sales_to_remove),
+                    'backup_file': backup_file
+                }
+            
+            return {'removed_count': 0, 'backup_file': None}
+            
+        except Exception as e:
+            print(f"Error limpiando ventas antiguas: {e}")
+            return None
+    
+    def validate_sale_data(self, sale_data):
+        """Valida los datos de una venta antes de registrarla"""
+        errors = []
+        
+        # Validar items
+        if not sale_data.get('items') or not isinstance(sale_data['items'], list):
+            errors.append("La venta debe tener al menos un producto")
+        else:
+            for i, item in enumerate(sale_data['items']):
+                if not item.get('name'):
+                    errors.append(f"Item {i+1}: Nombre requerido")
+                if not isinstance(item.get('quantity'), int) or item['quantity'] <= 0:
+                    errors.append(f"Item {i+1}: Cantidad debe ser un entero positivo")
+                if not isinstance(item.get('unit_price'), (int, float)) or item['unit_price'] <= 0:
+                    errors.append(f"Item {i+1}: Precio unitario debe ser positivo")
+        
+        # Validar totales
+        if not isinstance(sale_data.get('total'), (int, float)) or sale_data['total'] <= 0:
+            errors.append("El total debe ser un número positivo")
+        
+        # Validar información de pago
+        payment_info = sale_data.get('payment_info', {})
+        if payment_info:
+            method = payment_info.get('method')
+            if method not in ['USD', 'VES', 'MIXTO']:
+                errors.append("Método de pago inválido")
+        
+        return errors
+
+class InventoryManager:
+    def __init__(self, data_file="data/inventory.json"):
+        self.data_file = data_file
+        self.products = {}
+        self.next_id = 1
+        self.load_inventory()
+    
+    def load_inventory(self):
+        """Carga el inventario desde el archivo"""
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.products = data.get('products', {})
+                    self.next_id = data.get('next_id', 1)
+                    
+                    # Convertir IDs de string a int si es necesario
+                    if self.products:
+                        converted_products = {}
+                        for key, value in self.products.items():
+                            converted_products[int(key)] = value
+                        self.products = converted_products
+            else:
+                # Crear algunos productos de ejemplo si no existe el archivo
+                self._create_sample_products()
+                
+        except Exception as e:
+            print(f"Error cargando inventario: {e}")
+            self.products = {}
+            self.next_id = 1
+            self._create_sample_products()
+    
+    def save_inventory(self):
+        """Guarda el inventario en el archivo"""
+        try:
+            # Crear directorio si no existe
+            os.makedirs(os.path.dirname(self.data_file), exist_ok=True)
+            
+            # Convertir IDs a string para JSON
+            products_for_json = {}
+            for key, value in self.products.items():
+                products_for_json[str(key)] = value
+            
+            data = {
+                'products': products_for_json,
+                'next_id': self.next_id
+            }
+            
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+                
+        except Exception as e:
+            print(f"Error guardando inventario: {e}")
+    
+    def _create_sample_products(self):
+        """Crea productos de ejemplo"""
+        sample_products = [
+            {
+                'name': 'Coca Cola 600ml',
+                'price_usd': 1.50,
+                'stock': 25,
+                'profit_percentage': 0
+            },
+            {
+                'name': 'Pan de Sandwich',
+                'price_usd': 2.00,
+                'stock': 15,
+                'profit_percentage': 0
+            },
+            {
+                'name': 'Leche Completa 1L',
+                'price_usd': 3.50,
+                'stock': 20,
+                'profit_percentage': 0
+            },
+            {
+                'name': 'Arroz 1kg',
+                'price_usd': 1.25,
+                'stock': 30,
+                'profit_percentage': 0
+            },
+            {
+                'name': 'Aceite de Cocina 1L',
+                'price_usd': 4.00,
+                'stock': 12,
+                'profit_percentage': 0
+            },
+            {
+                'name': 'Pasta Espagueti 500g',
+                'price_usd': 1.75,
+                'stock': 18,
+                'profit_percentage': 0
+            },
+            {
+                'name': 'Atún en Lata',
+                'price_usd': 2.25,
+                'stock': 22,
+                'profit_percentage': 0
+            },
+            {
+                'name': 'Jabón de Baño',
+                'price_usd': 1.00,
+                'stock': 35,
+                'profit_percentage': 0
+            }
+        ]
+        
+        for product_data in sample_products:
+            self.add_product(product_data)
+    
+    def add_product(self, product_data):
+        """Agrega un nuevo producto al inventario"""
+        try:
+            product_id = self.next_id
+            
+            # Validar datos requeridos
+            if not product_data.get('name'):
+                raise ValueError("El nombre del producto es requerido")
+            
+            if not isinstance(product_data.get('price_usd'), (int, float)) or product_data['price_usd'] <= 0:
+                raise ValueError("El precio debe ser un número positivo")
+            
+            if not isinstance(product_data.get('stock'), int) or product_data['stock'] < 0:
+                raise ValueError("El stock debe ser un número entero no negativo")
+            
+            # Crear el producto
+            product = {
+                'id': product_id,
+                'name': product_data['name'].strip(),
+                'price_usd': float(product_data['price_usd']),
+                'stock': int(product_data['stock']),
+                'profit_percentage': float(product_data.get('profit_percentage', 0)),
+                'created_at': datetime.now().isoformat(),
+                'updated_at': datetime.now().isoformat()
+            }
+            
+            # Verificar que no exista un producto con el mismo nombre
+            for existing_product in self.products.values():
+                if existing_product['name'].lower() == product['name'].lower():
+                    raise ValueError(f"Ya existe un producto con el nombre '{product['name']}'")
+            
+            # Agregar al inventario
+            self.products[product_id] = product
+            self.next_id += 1
+            
+            # Guardar cambios
+            self.save_inventory()
+            
+            return product_id
+            
+        except Exception as e:
+            print(f"Error agregando producto: {e}")
+            return None
+    
+    def get_product(self, product_id):
+        """Obtiene un producto por su ID"""
+        return self.products.get(product_id)
+    
+    def get_all_products(self):
+        """Obtiene todos los productos como lista"""
+        return list(self.products.values())
+    
+    def update_product(self, product_id, updates):
+        """Actualiza un producto existente"""
+        try:
+            if product_id not in self.products:
+                raise ValueError(f"Producto con ID {product_id} no encontrado")
+            
+            product = self.products[product_id]
+            
+            # Actualizar campos permitidos
+            allowed_fields = ['name', 'price_usd', 'stock', 'profit_percentage']
+            
+            for field, value in updates.items():
+                if field in allowed_fields:
+                    if field == 'name' and value:
+                        # Verificar nombre único (excluyendo el producto actual)
+                        for pid, existing_product in self.products.items():
+                            if pid != product_id and existing_product['name'].lower() == value.lower():
+                                raise ValueError(f"Ya existe un producto con el nombre '{value}'")
+                        product[field] = value.strip()
+                    
+                    elif field == 'price_usd':
+                        if not isinstance(value, (int, float)) or value <= 0:
+                            raise ValueError("El precio debe ser un número positivo")
+                        product[field] = float(value)
+                    
+                    elif field == 'stock':
+                        if not isinstance(value, int) or value < 0:
+                            raise ValueError("El stock debe ser un número entero no negativo")
+                        product[field] = int(value)
+                    
+                    elif field == 'profit_percentage':
+                        product[field] = float(value)
+            
+            # Actualizar timestamp
+            product['updated_at'] = datetime.now().isoformat()
+            
+            # Guardar cambios
+            self.save_inventory()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error actualizando producto: {e}")
+            return False
+    
+    def update_stock(self, product_id, quantity_change):
+        """Actualiza el stock de un producto (puede ser positivo o negativo)"""
+        try:
+            if product_id not in self.products:
+                raise ValueError(f"Producto con ID {product_id} no encontrado")
+            
+            product = self.products[product_id]
+            new_stock = product['stock'] + quantity_change
+            
+            if new_stock < 0:
+                raise ValueError(f"Stock insuficiente. Stock actual: {product['stock']}, cambio solicitado: {quantity_change}")
+            
+            product['stock'] = new_stock
+            product['updated_at'] = datetime.now().isoformat()
+            
+            # Guardar cambios
+            self.save_inventory()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error actualizando stock: {e}")
+            return False
+    
+    def delete_product(self, product_id):
+        """Elimina un producto del inventario"""
+        try:
+            if product_id not in self.products:
+                raise ValueError(f"Producto con ID {product_id} no encontrado")
+            
+            deleted_product = self.products.pop(product_id)
+            
+            # Guardar cambios
+            self.save_inventory()
+            
+            return deleted_product
+            
+        except Exception as e:
+            print(f"Error eliminando producto: {e}")
+            return None
+    
+    def search_products(self, search_term):
+        """Busca productos por nombre"""
+        search_term = search_term.lower().strip()
+        results = []
+        
+        for product in self.products.values():
+            if search_term in product['name'].lower():
+                results.append(product)
+        
+        return results
+    
+    def get_low_stock_products(self, threshold=5):
+        """Obtiene productos con stock bajo"""
+        low_stock = []
+        
+        for product in self.products.values():
+            if product['stock'] <= threshold:
+                low_stock.append(product)
+        
+        return low_stock
+    
+    def get_out_of_stock_products(self):
+        """Obtiene productos sin stock"""
+        return [product for product in self.products.values() if product['stock'] == 0]
+    
+    def get_inventory_value(self, exchange_manager=None):
+        """Calcula el valor total del inventario"""
+        total_usd = 0
+        
+        for product in self.products.values():
+            total_usd += product['price_usd'] * product['stock']
+        
+        result = {'total_usd': total_usd}
+        
+        if exchange_manager:
+            result['total_ves'] = exchange_manager.convert_usd_to_ves(total_usd)
+        
+        return result
+    
+    def get_inventory_summary(self):
+        """Obtiene un resumen del inventario"""
+        total_products = len(self.products)
+        total_items = sum(product['stock'] for product in self.products.values())
+        low_stock_count = len(self.get_low_stock_products())
+        out_of_stock_count = len(self.get_out_of_stock_products())
+        
+        return {
+            'total_products': total_products,
+            'total_items': total_items,
+            'low_stock_count': low_stock_count,
+            'out_of_stock_count': out_of_stock_count
+        }
+    
+    def export_inventory(self, filename=None):
+        """Exporta el inventario a un archivo CSV"""
+        try:
+            if not filename:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"data/inventory_export_{timestamp}.csv"
+            
+            import csv
+            
+            # Crear directorio si no existe
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            
+            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['ID', 'Nombre', 'Precio USD', 'Stock', 'Porcentaje Ganancia', 'Creado', 'Actualizado']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                writer.writeheader()
+                for product in self.products.values():
+                    writer.writerow({
+                        'ID': product['id'],
+                        'Nombre': product['name'],
+                        'Precio USD': product['price_usd'],
+                        'Stock': product['stock'],
+                        'Porcentaje Ganancia': product['profit_percentage'],
+                        'Creado': product['created_at'],
+                        'Actualizado': product['updated_at']
+                    })
+            
+            return filename
+            
+        except Exception as e:
+            print(f"Error exportando inventario: {e}")
+            return None
+    
+    def backup_inventory(self):
+        """Crea una copia de seguridad del inventario"""
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_filename = f"data/inventory_backup_{timestamp}.json"
+            
+            # Crear directorio si no existe
+            os.makedirs(os.path.dirname(backup_filename), exist_ok=True)
+            
+            # Copiar archivo actual
+            import shutil
+            if os.path.exists(self.data_file):
+                shutil.copy2(self.data_file, backup_filename)
+                return backup_filename
+            
+        except Exception as e:
+            print(f"Error creando backup: {e}")
+            return None
+
+
+class ExchangeManager:
+    def __init__(self):
+        self.current_rate = 36.0  # Tasa por defecto
+        self.last_update = None
+        self.api_url = "https://api.exchangerate-api.com/v4/latest/USD"
+        self.backup_apis = [
+            "https://api.fixer.io/latest?base=USD&symbols=VES",
+            "https://v6.exchangerate-api.com/v6/YOUR_API_KEY/latest/USD"
+        ]
+    
+    def update_exchange_rate(self):
+        """Actualiza la tasa de cambio desde APIs externas"""
+        try:
+            # Intentar con la API principal
+            response = requests.get(self.api_url, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Buscar tasa VES
+                if 'rates' in data and 'VES' in data['rates']:
+                    new_rate = float(data['rates']['VES'])
+                    
+                    # Validar que la tasa sea razonable (entre 1 y 1000)
+                    if 1 <= new_rate <= 1000:
+                        self.current_rate = new_rate
+                        self.last_update = datetime.now()
+                        print(f"Tasa actualizada: 1 USD = {self.current_rate:.2f} VES")
+                        return True
+                
+            # Si falla, usar tasa por defecto con incremento aleatorio
+            self._use_fallback_rate()
+            return False
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error conectando a API de cambio: {e}")
+            self._use_fallback_rate()
+            return False
+        except Exception as e:
+            print(f"Error actualizando tasa de cambio: {e}")
+            self._use_fallback_rate()
+            return False
+
+    def update_rate(self):
+        """Alias para update_exchange_rate()"""
+        return self.update_exchange_rate()
+
+    def _use_fallback_rate(self):
+        """Usa una tasa de respaldo con variación simulada"""
+        import random
+        
+        # Simular variación del mercado (±5%)
+        base_rate = 36.0
+        variation = random.uniform(-0.05, 0.05)
+        self.current_rate = base_rate * (1 + variation)
+        self.last_update = datetime.now()
+        print(f"Usando tasa de respaldo: 1 USD = {self.current_rate:.2f} VES")
+    
+    def convert_usd_to_ves(self, usd_amount):
+        """Convierte USD a VES"""
+        return usd_amount * self.current_rate
+    
+    def convert_ves_to_usd(self, ves_amount):
+        """Convierte VES a USD"""
+        ves_amount = float(ves_amount) if ves_amount else 0
+        return ves_amount / self.current_rate
+    
+    def get_rate_info(self):
+        """Obtiene información sobre la tasa actual"""
+        return {
+            'rate': self.current_rate,
+            'last_update': self.last_update,
+            'formatted_rate': f"1 USD = {self.current_rate:,.2f} VES"
+        }
+    
+    def is_rate_stale(self, max_age_minutes=30):
+        """Verifica si la tasa necesita actualización"""
+        if not self.last_update:
+            return True
+        
+        from datetime import timedelta
+        age = datetime.now() - self.last_update
+        return age > timedelta(minutes=max_age_minutes)
+
+class BackupManager:
+    def __init__(self, db_manager):
+        self.db_manager = db_manager
+        self.backup_file = BACKUP_FILE
+    
+    def create_daily_backup(self):
+        """Crea un backup diario"""
+        try:
+            backup_data = {
+                'date': datetime.datetime.now().isoformat(),
+                'products': self.db_manager.get_products(),
+                'daily_sales': self.db_manager.get_daily_sales()
+            }
+            
+            with open(self.backup_file, 'w', encoding='utf-8') as f:
+                json.dump(backup_data, f, indent=2, ensure_ascii=False)
+            
+            return True, "Backup creado exitosamente"
+        except Exception as e:
+            return False, f"Error creando backup: {str(e)}"
+    
+    def restore_from_backup(self):
+        """Restaura desde el backup si existe"""
+        try:
+            if os.path.exists(self.backup_file):
+                with open(self.backup_file, 'r', encoding='utf-8') as f:
+                    backup_data = json.load(f)
+                
+                # Aquí podrías implementar la lógica de restauración
+                return True, "Backup restaurado exitosamente"
+            else:
+                return False, "No se encontró archivo de backup"
+        except Exception as e:
+            return False, f"Error restaurando backup: {str(e)}"
+
+class CustomFrame(tk.Frame):
+    def __init__(self, parent, frame_type="normal", **kwargs):
+        style_manager = StyleManager()
+        
+        if frame_type == "card":
+            kwargs.update({
+                'bg': style_manager.colors["bg_card"],
+                'relief': 'flat',
+                'bd': 0,
+                'borderwidth': 0,
+                'highlightthickness': 0,
+                'padx': 0,  # Aumentar el espacio interno
+                'pady': 0   # Aumentar el espacio interno
+            })
+        else:
+            kwargs.update({
+                'bg': style_manager.colors["bg_primary"]
+            })
+        
+        super().__init__(parent, **kwargs)
+
+
+class CustomLabel(tk.Label):
+    def __init__(self, parent, text, label_type="normal", **kwargs):
+        style_manager = StyleManager()
+        
+        font_config = style_manager.fonts.get(label_type, style_manager.fonts["normal"])
+        color_config = style_manager.colors["text_primary"]
+        bg_config = style_manager.colors["bg_primary"]  # Fondo más suave
+        
+        if label_type in ["title", "subtitle"]:
+            color_config = style_manager.colors["text_light"]  # Texto más claro para títulos
+        
+        kwargs.update({
+            'font': font_config,
+            'fg': color_config,
+            'bg': bg_config
+        })
+        
+        super().__init__(parent, text=text, **kwargs)
+
+
+class CustomButton(tk.Button):
+    def __init__(self, parent, text, command=None, button_type="primary", **kwargs):
+        style_manager = StyleManager()
+        
+        color_map = {
+            "primary": style_manager.colors["accent"],  # Color más suave
+            "success": style_manager.colors["success"],
+            "warning": style_manager.colors["warning"],
+            "danger": style_manager.colors["danger"],
+            "secondary": style_manager.colors["bg_secondary"]
+        }
+        
+        kwargs.update({
+            'font': style_manager.fonts["normal"],
+            'bg': color_map.get(button_type, style_manager.colors["accent"]),
+            'fg': style_manager.colors["text_light"],
+            'relief': 'flat',  # Sin borde grueso
+            'bd': 1,  # Borde más sutil
+            'highlightthickness': 0,  # Eliminar el borde de resaltado
+            'padx': 10,
+            'pady': 5,
+            'cursor': 'hand2'
+        })
+        
+        super().__init__(parent, text=text, command=command, **kwargs)
+
+
+class BaseDialog:
+    def __init__(self, parent, title, size="400x300"):
+        self.parent = parent
+        self.result = None
+        self.style_manager = StyleManager()
+        
+        # Crear ventana
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.geometry(size)
+        self.window.configure(bg=self.style_manager.colors["bg_primary"])
+        self.window.transient(parent)
+        self.window.grab_set()
+        
+        # Centrar ventana
+        self._center_window()
+        
+        # Configurar eventos de teclado
+        self.window.bind('<Escape>', lambda e: self._on_cancel())
+        self.window.bind('<Return>', lambda e: self._on_accept())
+        self.window.focus_set()
+    
+    def _center_window(self):
+        """Centra la ventana en la pantalla"""
+        self.window.update_idletasks()
+        x = (self.window.winfo_screenwidth() // 2) - (self.window.winfo_width() // 2)
+        y = (self.window.winfo_screenheight() // 2) - (self.window.winfo_height() // 2)
+        self.window.geometry(f"+{x}+{y}")
+    
+    def _on_accept(self):
+        """Método a sobrescribir para aceptar"""
+        self.result = True
+        self.window.destroy()
+    
+    def _on_cancel(self):
+        """Método a sobrescribir para cancelar"""
+        self.result = False
+        self.window.destroy()
+
+class AddProductDialog(BaseDialog):
+    def __init__(self, parent, exchange_manager):
+        self.exchange_manager = exchange_manager
+        self.product_data = None
+        super().__init__(parent, "➕ Agregar Producto", "500x400")
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Configura la interfaz del diálogo"""
+        main_frame = CustomFrame(self.window)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Título
+        CustomLabel(main_frame, "Agregar Nuevo Producto", label_type="title").pack(pady=(0, 20))
+        
+        # Nombre del producto
+        CustomLabel(main_frame, "Nombre del Producto:", label_type="normal").pack(anchor="w", pady=(5, 10))
+        self.name_entry = tk.Entry(main_frame, font=self.style_manager.fonts["normal"], width=40)
+        self.name_entry.pack(pady=(5, 15), fill="x")
+        self.name_entry.focus_set()
+        
+        # Precio en USD
+        CustomLabel(main_frame, "Precio USD:", label_type="normal").pack(anchor="w")
+        self.price_usd_entry = tk.Entry(main_frame, font=self.style_manager.fonts["normal"], width=20)
+        self.price_usd_entry.pack(pady=(5, 10))
+        self.price_usd_entry.bind('<KeyRelease>', self._update_ves_price)
+        
+        # Precio en VES (calculado automáticamente)
+        CustomLabel(main_frame, "Precio VES (Calculado):", label_type="normal").pack(anchor="w")
+        self.price_ves_label = CustomLabel(main_frame, "Bs. 0.00", label_type="large")
+        self.price_ves_label.pack(pady=(5, 15))
+        
+        # Porcentaje de ganancia
+        CustomLabel(main_frame, "Porcentaje de Ganancia (%):", label_type="normal").pack(anchor="w")
+        self.profit_entry = tk.Entry(main_frame, font=self.style_manager.fonts["normal"], width=20)
+        self.profit_entry.pack(pady=(5, 10))
+        self.profit_entry.bind('<KeyRelease>', self._update_final_price)
+        
+        # Stock inicial
+        CustomLabel(main_frame, "Stock Inicial:", label_type="normal").pack(anchor="w")
+        self.stock_entry = tk.Entry(main_frame, font=self.style_manager.fonts["normal"], width=20)
+        self.stock_entry.pack(pady=(5, 15))
+        
+        # Botones
+        buttons_frame = CustomFrame(main_frame)
+        buttons_frame.pack(fill="x", pady=20)
+        
+        cancel_btn = CustomButton(buttons_frame, "❌ Cancelar", 
+                                 command=self._on_cancel, button_type="secondary")
+        cancel_btn.pack(side="right", padx=(10, 0))
+        
+        save_btn = CustomButton(buttons_frame, "💾 Guardar", 
+                               command=self._save_product, button_type="success")
+        save_btn.pack(side="right")
+    
+    def _update_ves_price(self, event=None):
+        """Actualiza el precio en VES cuando cambia el precio USD"""
+        try:
+            usd_price = float(self.price_usd_entry.get() or 0)
+            profit_percent = float(self.profit_entry.get() or 0)
+            
+            # Aplicar porcentaje de ganancia
+            final_usd_price = usd_price * (1 + profit_percent / 100)
+            ves_price = self.exchange_manager.convert_usd_to_ves(final_usd_price)
+            
+            self.price_ves_label.config(text=f"Bs. {ves_price:,.2f}")
+        except ValueError:
+            self.price_ves_label.config(text="Bs. 0.00")
+    
+    def _update_final_price(self, event=None):
+        """Actualiza el precio final cuando cambia el porcentaje de ganancia"""
+        self._update_ves_price()
+    
+    def _save_product(self):
+        """Guarda el producto"""
+        try:
+            name = self.name_entry.get().strip()
+            price_usd = float(self.price_usd_entry.get() or 0)
+            stock = int(float(self.stock_entry.get() or 0))
+            profit_percent = float(self.profit_entry.get() or 0)
+            
+            if not name:
+                messagebox.showerror("Error", "El nombre del producto es obligatorio")
+                return
+            
+            if price_usd <= 0:
+                messagebox.showerror("Error", "El precio debe ser mayor que cero")
+                return
+            
+            if stock < 0:
+                messagebox.showerror("Error", "El stock no puede ser negativo")
+                return
+            
+            # Aplicar porcentaje de ganancia al precio
+            final_price_usd = price_usd * (1 + profit_percent / 100)
+            
+            self.product_data = {
+                'name': name,
+                'price_usd': final_price_usd,
+                'stock': stock,
+                'profit_percentage': profit_percent
+            }
+            
+            self.result = True
+            self.window.destroy()
+            
+        except ValueError:
+            messagebox.showerror("Error", "Por favor ingrese valores numéricos válidos")
+
+class DiscountDialog(BaseDialog):
+    def __init__(self, parent, current_total):
+        self.current_total = current_total
+        self.discount_percentage = 0
+        super().__init__(parent, "💰 Aplicar Descuento", "400x250")
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Configura la interfaz del descuento"""
+        main_frame = CustomFrame(self.window)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Título
+        CustomLabel(main_frame, "Aplicar Descuento", label_type="title").pack(pady=(0, 20))
+        
+        # Total actual
+        CustomLabel(main_frame, f"Total Actual: ${self.current_total:.2f}", 
+                   label_type="large").pack(pady=(0, 15))
+        
+        # Porcentaje de descuento
+        CustomLabel(main_frame, "Porcentaje de Descuento (%):", label_type="normal").pack(anchor="w")
+        self.discount_entry = tk.Entry(main_frame, font=self.style_manager.fonts["normal"], width=20)
+        self.discount_entry.pack(pady=(5, 10))
+        self.discount_entry.bind('<KeyRelease>', self._update_preview)
+        self.discount_entry.focus_set()
+        
+        # Vista previa del nuevo total
+        self.preview_label = CustomLabel(main_frame, "Nuevo Total: $0.00", label_type="large")
+        self.preview_label.pack(pady=(10, 20))
+        
+        # Botones
+        buttons_frame = CustomFrame(main_frame)
+        buttons_frame.pack(fill="x", pady=20)
+        
+        cancel_btn = CustomButton(buttons_frame, "❌ Cancelar", 
+                                 command=self._on_cancel, button_type="secondary")
+        cancel_btn.pack(side="right", padx=(10, 0))
+        
+        apply_btn = CustomButton(buttons_frame, "✅ Aplicar", 
+                               command=self._apply_discount, button_type="success")
+        apply_btn.pack(side="right")
+    
+    def _update_preview(self, event=None):
+        """Actualiza la vista previa del descuento"""
+        try:
+            discount = float(self.discount_entry.get() or 0)
+            if 0 <= discount <= 100:
+                new_total = self.current_total * (1 - discount / 100)
+                self.preview_label.config(text=f"Nuevo Total: ${new_total:.2f}")
+            else:
+                self.preview_label.config(text="Descuento inválido (0-100%)")
+        except ValueError:
+            self.preview_label.config(text="Nuevo Total: $0.00")
+    
+    def _apply_discount(self):
+        """Aplica el descuento"""
+        try:
+            discount = float(self.discount_entry.get() or 0)
+            if 0 <= discount <= 100:
+                self.discount_percentage = discount
+                self.result = True
+                self.window.destroy()
+            else:
+                messagebox.showerror("Error", "El descuento debe estar entre 0 y 100%")
+        except ValueError:
+            messagebox.showerror("Error", "Por favor ingrese un porcentaje válido")
+
+class PaymentDialog(BaseDialog):
+    def __init__(self, parent, total_usd, exchange_manager):
+        self.total_usd = total_usd
+        self.exchange_manager = exchange_manager
+        self.payment_data = None
+        super().__init__(parent, "💳 Procesar Pago", "600x500")
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Configura la interfaz de pago"""
+        main_frame = CustomFrame(self.window)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Título
+        CustomLabel(main_frame, "Procesar Pago", label_type="title").pack(pady=(0, 20))
+        
+        # Totales
+        total_ves = self.exchange_manager.convert_usd_to_ves(self.total_usd)
+        
+        totals_frame = CustomFrame(main_frame, frame_type="card")
+        totals_frame.pack(fill="x", pady=(0, 20))
+        
+        CustomLabel(totals_frame, f"Total a Pagar: ${self.total_usd:.2f} | Bs. {total_ves:,.2f}", 
+                   label_type="large").pack(pady=10)
+        
+        # Método de pago
+        CustomLabel(main_frame, "Método de Pago:", label_type="subtitle").pack(anchor="w", pady=(10, 5))
+        
+        self.payment_method = tk.StringVar(value="USD")
+        
+        methods_frame = CustomFrame(main_frame)
+        methods_frame.pack(fill="x", pady=(0, 20))
+        
+        tk.Radiobutton(methods_frame, text="💵 Solo USD", variable=self.payment_method, 
+                      value="USD", font=self.style_manager.fonts["normal"],
+                      command=self._on_method_change).pack(side="left", padx=(0, 20))
+        
+        tk.Radiobutton(methods_frame, text="💰 Solo Bolívares", variable=self.payment_method, 
+                      value="VES", font=self.style_manager.fonts["normal"],
+                      command=self._on_method_change).pack(side="left", padx=(0, 20))
+        
+        tk.Radiobutton(methods_frame, text="🔄 Mixto", variable=self.payment_method, 
+                      value="MIXTO", font=self.style_manager.fonts["normal"],
+                      command=self._on_method_change).pack(side="left")
+        
+        # Frame para montos recibidos
+        self.amounts_frame = CustomFrame(main_frame)
+        self.amounts_frame.pack(fill="x", pady=(0, 20))
+        
+        # Frame para cambio
+        self.change_frame = CustomFrame(main_frame)
+        self.change_frame.pack(fill="x", pady=(0, 20))
+        
+        # Inicializar campos
+        self._setup_payment_fields()
+        
+        # Botones
+        buttons_frame = CustomFrame(main_frame)
+        buttons_frame.pack(fill="x", pady=20)
+        
+        cancel_btn = CustomButton(buttons_frame, "❌ Cancelar", 
+                                 command=self._on_cancel, button_type="secondary")
+        cancel_btn.pack(side="right", padx=(10, 0))
+        
+        process_btn = CustomButton(buttons_frame, "✅ Procesar Pago", 
+                                  command=self._process_payment, button_type="success")
+        process_btn.pack(side="right")
+    
+    def _setup_payment_fields(self):
+        """Configura los campos de pago según el método seleccionado"""
+        # Limpiar frames
+        for widget in self.amounts_frame.winfo_children():
+            widget.destroy()
+        for widget in self.change_frame.winfo_children():
+            widget.destroy()
+        
+        method = self.payment_method.get()
+        
+        if method == "USD":
+            self._setup_usd_only()
+        elif method == "VES":
+            self._setup_ves_only()
+        else:  # MIXTO
+            self._setup_mixed_payment()
+    
+    def _setup_usd_only(self):
+        """Configura pago solo en USD"""
+        CustomLabel(self.amounts_frame, "Monto Recibido USD:", label_type="normal").pack(anchor="w")
+        self.usd_received_entry = tk.Entry(self.amounts_frame, font=self.style_manager.fonts["normal"])
+        self.usd_received_entry.pack(pady=(5, 10), fill="x")
+        self.usd_received_entry.insert(0, str(self.total_usd))
+        self.usd_received_entry.bind('<KeyRelease>', self._calculate_change)
+        self.usd_received_entry.focus_set()
+        
+        # Cambio
+        CustomLabel(self.change_frame, "Cambio:", label_type="subtitle").pack(anchor="w")
+        self.change_usd_label = CustomLabel(self.change_frame, "USD: $0.00", label_type="normal")
+        self.change_usd_label.pack(anchor="w")
+        self.change_ves_label = CustomLabel(self.change_frame, "VES: Bs. 0.00", label_type="normal")
+        self.change_ves_label.pack(anchor="w")
+    
+    def _setup_ves_only(self):
+        """Configura pago solo en Bolívares"""
+        total_ves = self.exchange_manager.convert_usd_to_ves(self.total_usd)
+        
+        CustomLabel(self.amounts_frame, "Monto Recibido VES:", label_type="normal").pack(anchor="w")
+        self.ves_received_entry = tk.Entry(self.amounts_frame, font=self.style_manager.fonts["normal"])
+        self.ves_received_entry.pack(pady=(5, 10), fill="x")
+        self.ves_received_entry.insert(0, f"{total_ves:.2f}")
+        self.ves_received_entry.bind('<KeyRelease>', self._calculate_change)
+        self.ves_received_entry.focus_set()
+        
+        # Cambio
+        CustomLabel(self.change_frame, "Cambio:", label_type="subtitle").pack(anchor="w")
+        self.change_ves_label = CustomLabel(self.change_frame, "VES: Bs. 0.00", label_type="normal")
+        self.change_ves_label.pack(anchor="w")
+    
+    def _setup_mixed_payment(self):
+        """Configura pago mixto"""
+        # Montos recibidos
+        CustomLabel(self.amounts_frame, "Montos Recibidos:", label_type="subtitle").pack(anchor="w")
+        
+        CustomLabel(self.amounts_frame, "USD Recibidos:", label_type="normal").pack(anchor="w")
+        self.usd_received_entry = tk.Entry(self.amounts_frame, font=self.style_manager.fonts["normal"])
+        self.usd_received_entry.pack(pady=(5, 10), fill="x")
+        self.usd_received_entry.bind('<KeyRelease>', self._calculate_mixed_payment)
+        self.usd_received_entry.focus_set()
+        
+        CustomLabel(self.amounts_frame, "VES Recibidos:", label_type="normal").pack(anchor="w")
+        self.ves_received_entry = tk.Entry(self.amounts_frame, font=self.style_manager.fonts["normal"])
+        self.ves_received_entry.pack(pady=(5, 10), fill="x")
+        self.ves_received_entry.bind('<KeyRelease>', self._calculate_mixed_payment)
+        
+        # Cambio
+        CustomLabel(self.change_frame, "Cambio:", label_type="subtitle").pack(anchor="w")
+        
+        CustomLabel(self.change_frame, "Cambio USD (editable):", label_type="normal").pack(anchor="w")
+        self.change_usd_entry = tk.Entry(self.change_frame, font=self.style_manager.fonts["normal"])
+        self.change_usd_entry.pack(pady=(5, 5), fill="x")
+        self.change_usd_entry.bind('<KeyRelease>', self._update_ves_change)
+        
+        self.change_ves_label = CustomLabel(self.change_frame, "Cambio VES: Bs. 0.00", label_type="normal")
+        self.change_ves_label.pack(anchor="w", pady=(5, 0))
+    
+    def _on_method_change(self):
+        """Maneja el cambio de método de pago"""
+        self._setup_payment_fields()
+    
+    def _calculate_change(self, event=None):
+        """Calcula el cambio para pagos simples"""
+        method = self.payment_method.get()
+        
+        try:
+            if method == "USD":
+                received = float(self.usd_received_entry.get() or 0)
+                change_usd = max(0, received - self.total_usd)
+                change_ves = self.exchange_manager.convert_usd_to_ves(change_usd)
+                
+                self.change_usd_label.config(text=f"USD: ${change_usd:.2f}")
+                self.change_ves_label.config(text=f"VES: Bs. {change_ves:,.2f}")
+                
+            elif method == "VES":
+                received = float(self.ves_received_entry.get() or 0)
+                total_ves = self.exchange_manager.convert_usd_to_ves(self.total_usd)
+                change_ves = max(0, received - total_ves)
+                
+                self.change_ves_label.config(text=f"VES: Bs. {change_ves:,.2f}")
+                
+        except ValueError:
+            pass
+    
+    def _calculate_mixed_payment(self, event=None):
+        """Calcula el pago mixto automáticamente"""
+        try:
+            usd_received = float(self.usd_received_entry.get() or 0)
+            ves_received = float(self.ves_received_entry.get() or 0)
+            
+            # Convertir todo a USD para calcular
+            total_received_usd = usd_received + self.exchange_manager.convert_ves_to_usd(ves_received)
+            
+            if total_received_usd > self.total_usd:
+                # Hay cambio
+                change_total_usd = total_received_usd - self.total_usd
+                self.change_usd_entry.delete(0, tk.END)
+                self.change_usd_entry.insert(0, f"{change_total_usd:.2f}")
+                self._update_ves_change()
+            else:
+                # Calcular cuánto falta en VES
+                remaining_usd = self.total_usd - total_received_usd
+                remaining_ves = self.exchange_manager.convert_usd_to_ves(remaining_usd)
+                
+                if remaining_usd > 0:
+                    current_ves = float(self.ves_received_entry.get() or 0)
+                    suggested_ves = current_ves + remaining_ves
+                    self.ves_received_entry.delete(0, tk.END)
+                    self.ves_received_entry.insert(0, f"{suggested_ves:.2f}")
+                
+        except ValueError:
+            pass
+    
+    def _update_ves_change(self, event=None):
+        """Actualiza el cambio en VES basado en el cambio USD"""
+        try:
+            change_usd = float(self.change_usd_entry.get() or 0)
+            
+            # Calcular el cambio total
+            usd_received = float(self.usd_received_entry.get() or 0)
+            ves_received = float(self.ves_received_entry.get() or 0)
+            total_received_usd = usd_received + self.exchange_manager.convert_ves_to_usd(ves_received)
+            
+            total_change_usd = total_received_usd - self.total_usd
+            remaining_change_usd = max(0, total_change_usd - change_usd)
+            change_ves = self.exchange_manager.convert_usd_to_ves(remaining_change_usd)
+            
+            self.change_ves_label.config(text=f"Cambio VES: Bs. {change_ves:,.2f}")
+            
+        except ValueError:
+            self.change_ves_label.config(text="Cambio VES: Bs. 0.00")
+    
+    def _process_payment(self):
+        """Procesa el pago"""
+        try:
+            method = self.payment_method.get()
+            
+            if method == "USD":
+                usd_received = float(self.usd_received_entry.get() or 0)
+                if usd_received < self.total_usd:
+                    messagebox.showerror("Error", "El monto recibido es insuficiente")
+                    return
+                
+                change_usd = usd_received - self.total_usd
+                
+                self.payment_data = {
+                    'method': 'USD',
+                    'usd_received': usd_received,
+                    'ves_received': 0,
+                    'usd_change': change_usd,
+                    'ves_change': 0
+                }
+                
+            elif method == "VES":
+                ves_received = float(self.ves_received_entry.get() or 0)
+                total_ves = self.exchange_manager.convert_usd_to_ves(self.total_usd)
+                
+                if ves_received < total_ves:
+                    messagebox.showerror("Error", "El monto recibido es insuficiente")
+                    return
+                
+                change_ves = ves_received - total_ves
+                
+                self.payment_data = {
+                    'method': 'VES',
+                    'usd_received': 0,
+                    'ves_received': ves_received,
+                    'usd_change': 0,
+                    'ves_change': change_ves
+                }
+                
+            else:  # MIXTO
+                usd_received = float(self.usd_received_entry.get() or 0)
+                ves_received = float(self.ves_received_entry.get() or 0)
+                change_usd = float(self.change_usd_entry.get() or 0)
+                
+                total_received_usd = usd_received + self.exchange_manager.convert_ves_to_usd(ves_received)
+                
+                if total_received_usd < self.total_usd:
+                    messagebox.showerror("Error", "El monto total recibido es insuficiente")
+                    return
+                
+                total_change_usd = total_received_usd - self.total_usd
+                change_ves_usd = total_change_usd - change_usd
+                change_ves = self.exchange_manager.convert_usd_to_ves(change_ves_usd)
+                
+                self.payment_data = {
+                    'method': 'MIXTO',
+                    'usd_received': usd_received,
+                    'ves_received': ves_received,
+                    'usd_change': change_usd,
+                    'ves_change': change_ves
+                }
+            
+            self.result = True
+            self.window.destroy()
+            
+        except ValueError:
+            messagebox.showerror("Error", "Por favor ingrese valores numéricos válidos")
+
+class ReceiptDialog(BaseDialog):
+    def __init__(self, parent, sale_record, exchange_rate):
+        self.sale_record = sale_record
+        self.exchange_rate = exchange_rate
+        super().__init__(parent, "🧾 Recibo de Venta", "500x700")
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Configura la interfaz del recibo"""
+        main_frame = CustomFrame(self.window)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Crear un frame con scroll
+        canvas = tk.Canvas(main_frame, bg=self.style_manager.colors["bg_primary"])
+        scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = CustomFrame(canvas)
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Header del recibo
+        header_frame = CustomFrame(scrollable_frame)
+        header_frame.pack(fill="x", pady=(0, 20))
+        
+        CustomLabel(header_frame, "🧾 RECIBO DE VENTA", label_type="title").pack()
+        CustomLabel(header_frame, f"ID: {self.sale_record['id']}", label_type="normal").pack()
+        
+        # Fecha y hora
+        from datetime import datetime
+        sale_time = datetime.fromisoformat(self.sale_record['timestamp'])
+        CustomLabel(header_frame, f"📅 {sale_time.strftime('%d/%m/%Y %H:%M:%S')}", 
+                   label_type="normal").pack()
+        
+        # Separador
+        tk.Frame(scrollable_frame, height=2, bg=self.style_manager.colors["accent"]).pack(fill="x", pady=10)
+        
+        # Productos
+        products_frame = CustomFrame(scrollable_frame)
+        products_frame.pack(fill="x", pady=(0, 20))
+        
+        CustomLabel(products_frame, "PRODUCTOS:", label_type="subtitle").pack(anchor="w")
+        
+        for item in self.sale_record['items']:
+            item_frame = CustomFrame(products_frame)
+            item_frame.pack(fill="x", pady=5)
+            
+            # Nombre y cantidad
+            CustomLabel(item_frame, f"{item['name']} x{item['quantity']}", 
+                       label_type="normal").pack(anchor="w")
+            
+            # Precio unitario y total
+            price_text = f"${item['unit_price']:.2f} c/u = ${item['total_price']:.2f}"
+            CustomLabel(item_frame, price_text, label_type="small").pack(anchor="w", padx=20)
+        
+        # Separador
+        tk.Frame(scrollable_frame, height=1, bg=self.style_manager.colors["bg_secondary"]).pack(fill="x", pady=10)
+        
+        # Totales
+        totals_frame = CustomFrame(scrollable_frame)
+        totals_frame.pack(fill="x", pady=(0, 20))
+        
+        # Subtotal
+        CustomLabel(totals_frame, f"Subtotal: ${self.sale_record['subtotal']:.2f}", 
+                   label_type="normal").pack(anchor="w")
+        
+        # Descuento si aplica
+        if self.sale_record.get('discount_percentage', 0) > 0:
+            discount_amount = self.sale_record['subtotal'] * (self.sale_record['discount_percentage'] / 100)
+            CustomLabel(totals_frame, f"Descuento ({self.sale_record['discount_percentage']}%): -${discount_amount:.2f}", 
+                       label_type="normal").pack(anchor="w")
+        
+        # Total
+        CustomLabel(totals_frame, f"TOTAL: ${self.sale_record['total']:.2f}", 
+                   label_type="large").pack(anchor="w")
+        
+        # Total en VES
+        total_ves = self.sale_record['total'] * self.exchange_rate
+        CustomLabel(totals_frame, f"TOTAL VES: Bs. {total_ves:,.2f}", 
+                   label_type="large").pack(anchor="w")
+        
+        # Separador
+        tk.Frame(scrollable_frame, height=2, bg=self.style_manager.colors["accent"]).pack(fill="x", pady=10)
+        
+        # Información de pago
+        payment_frame = CustomFrame(scrollable_frame)
+        payment_frame.pack(fill="x", pady=(0, 20))
+        
+        CustomLabel(payment_frame, "INFORMACIÓN DE PAGO:", label_type="subtitle").pack(anchor="w")
+        
+        payment_info = self.sale_record.get('payment_info', {})
+        method = payment_info.get('method', 'USD')
+        
+        CustomLabel(payment_frame, f"Método: {method}", label_type="normal").pack(anchor="w")
+        
+        if method == "USD":
+            CustomLabel(payment_frame, f"Recibido: ${payment_info.get('usd_received', 0):.2f}", 
+                       label_type="normal").pack(anchor="w")
+            CustomLabel(payment_frame, f"Cambio: ${payment_info.get('usd_change', 0):.2f}", 
+                       label_type="normal").pack(anchor="w")
+        elif method == "VES":
+            CustomLabel(payment_frame, f"Recibido: Bs. {payment_info.get('ves_received', 0):,.2f}", 
+                       label_type="normal").pack(anchor="w")
+            CustomLabel(payment_frame, f"Cambio: Bs. {payment_info.get('ves_change', 0):,.2f}", 
+                       label_type="normal").pack(anchor="w")
+        else:  # MIXTO
+            CustomLabel(payment_frame, f"USD Recibidos: ${payment_info.get('usd_received', 0):.2f}", 
+                       label_type="normal").pack(anchor="w")
+            CustomLabel(payment_frame, f"VES Recibidos: Bs. {payment_info.get('ves_received', 0):,.2f}", 
+                       label_type="normal").pack(anchor="w")
+            CustomLabel(payment_frame, f"Cambio USD: ${payment_info.get('usd_change', 0):.2f}", 
+                       label_type="normal").pack(anchor="w")
+            CustomLabel(payment_frame, f"Cambio VES: Bs. {payment_info.get('ves_change', 0):,.2f}", 
+                       label_type="normal").pack(anchor="w")
+        
+        # Tasa de cambio
+        CustomLabel(payment_frame, f"Tasa de cambio: 1 USD = {self.exchange_rate:,.2f} VES", 
+                   label_type="small").pack(anchor="w", pady=(10, 0))
+        
+        # Footer
+        footer_frame = CustomFrame(scrollable_frame)
+        footer_frame.pack(fill="x", pady=20)
+        
+        CustomLabel(footer_frame, "¡Gracias por su compra!", label_type="subtitle").pack()
+        CustomLabel(footer_frame, "Sistema POS - Venezuela", label_type="small").pack()
+        
+        # Configurar scroll
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Botones
+        buttons_frame = CustomFrame(main_frame)
+        buttons_frame.pack(fill="x", pady=(10, 0))
+        
+        print_btn = CustomButton(buttons_frame, "🖨️ Imprimir", 
+                                command=self._print_receipt, button_type="primary")
+        print_btn.pack(side="left")
+        
+        close_btn = CustomButton(buttons_frame, "❌ Cerrar", 
+                                command=self._on_cancel, button_type="secondary")
+        close_btn.pack(side="right")
+    
+    def _print_receipt(self):
+        """Simula la impresión del recibo"""
+        messagebox.showinfo("Imprimir", "Función de impresión no implementada.\nRecibo enviado a impresora virtual.")
+
+class SalesHistoryDialog(BaseDialog):
+    def __init__(self, parent, sales_manager):
+        self.sales_manager = sales_manager
+        super().__init__(parent, "📊 Historial de Ventas", "800x600")
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Configura la interfaz del historial"""
+        main_frame = CustomFrame(self.window)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        # Título y filtros
+        header_frame = CustomFrame(main_frame)
+        header_frame.pack(fill="x", pady=(0, 20))
+        
+        CustomLabel(header_frame, "📊 Historial de Ventas", label_type="title").pack()
+        
+        # Filtros por fecha
+        filters_frame = CustomFrame(header_frame)
+        filters_frame.pack(fill="x", pady=(10, 0))
+        
+        CustomLabel(filters_frame, "Filtrar por fecha:", label_type="normal").pack(side="left")
+        
+        filter_buttons_frame = CustomFrame(filters_frame)
+        filter_buttons_frame.pack(side="right")
+        
+        CustomButton(filter_buttons_frame, "Hoy", 
+                    command=lambda: self._filter_sales("today"), 
+                    button_type="secondary").pack(side="left", padx=2)
+        
+        CustomButton(filter_buttons_frame, "Esta Semana", 
+                    command=lambda: self._filter_sales("week"), 
+                    button_type="secondary").pack(side="left", padx=2)
+        
+        CustomButton(filter_buttons_frame, "Este Mes", 
+                    command=lambda: self._filter_sales("month"), 
+                    button_type="secondary").pack(side="left", padx=2)
+        
+        CustomButton(filter_buttons_frame, "Todas", 
+                    command=lambda: self._filter_sales("all"), 
+                    button_type="primary").pack(side="left", padx=2)
+        
+        # Lista de ventas
+        list_frame = CustomFrame(main_frame)
+        list_frame.pack(fill="both", expand=True, pady=(0, 20))
+        
+        # Headers
+        headers_frame = CustomFrame(list_frame)
+        headers_frame.pack(fill="x", pady=(0, 10))
+        
+        CustomLabel(headers_frame, "ID", label_type="subtitle").pack(side="left", padx=(0, 20))
+        CustomLabel(headers_frame, "Fecha/Hora", label_type="subtitle").pack(side="left", padx=(0, 20))
+        CustomLabel(headers_frame, "Total USD", label_type="subtitle").pack(side="left", padx=(0, 20))
+        CustomLabel(headers_frame, "Método", label_type="subtitle").pack(side="left", padx=(0, 20))
+        CustomLabel(headers_frame, "Acciones", label_type="subtitle").pack(side="right")
+        
+        # Scrollable list
+        canvas = tk.Canvas(list_frame, bg=self.style_manager.colors["bg_primary"])
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        self.sales_list_frame = CustomFrame(canvas)
+        
+        self.sales_list_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=self.sales_list_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Resumen
+        summary_frame = CustomFrame(main_frame, frame_type="card")
+        summary_frame.pack(fill="x", pady=(0, 20))
+        
+        self.summary_label = CustomLabel(summary_frame, "Cargando resumen...", label_type="large")
+        self.summary_label.pack(pady=10)
+        
+        # Botón cerrar
+        close_btn = CustomButton(main_frame, "❌ Cerrar", 
+                                command=self._on_cancel, button_type="secondary")
+        close_btn.pack()
+        
+        # Cargar todas las ventas inicialmente
+        self._filter_sales("all")
+    
+    def _filter_sales(self, period):
+        """Filtra las ventas por período"""
+        from datetime import datetime, timedelta
+        
+        all_sales = self.sales_manager.get_all_sales()
+        filtered_sales = []
+        
+        now = datetime.now()
+        
+        if period == "today":
+            start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "week":
+            start_date = now - timedelta(days=7)
+        elif period == "month":
+            start_date = now - timedelta(days=30)
+        else:  # all
+            start_date = None
+        
+        for sale in all_sales:
+            sale_date = datetime.fromisoformat(sale['timestamp'])
+            if start_date is None or sale_date >= start_date:
+                filtered_sales.append(sale)
+        
+        self._display_sales(filtered_sales)
+    
+    def _display_sales(self, sales):
+        """Muestra las ventas en la lista"""
+        # Limpiar lista actual
+        for widget in self.sales_list_frame.winfo_children():
+            widget.destroy()
+        
+        if not sales:
+            CustomLabel(self.sales_list_frame, "No hay ventas para mostrar", 
+                       label_type="normal").pack(pady=20)
+            self.summary_label.config(text="Total: $0.00 | Ventas: 0")
+            return
+        
+        # Mostrar ventas
+        total_amount = 0
+        for sale in reversed(sales):  # Más recientes primero
+            sale_frame = CustomFrame(self.sales_list_frame, frame_type="card")
+            sale_frame.pack(fill="x", pady=2, padx=5)
+            
+            # Información de la venta
+            info_frame = CustomFrame(sale_frame)
+            info_frame.pack(side="left", fill="x", expand=True, padx=10, pady=5)
+            
+            from datetime import datetime
+            sale_time = datetime.fromisoformat(sale['timestamp'])
+            
+            CustomLabel(info_frame, f"#{sale['id']}", label_type="normal").pack(side="left", padx=(0, 20))
+            CustomLabel(info_frame, sale_time.strftime('%d/%m/%Y %H:%M'), 
+                       label_type="normal").pack(side="left", padx=(0, 20))
+            CustomLabel(info_frame, f"${sale['total']:.2f}", 
+                       label_type="normal").pack(side="left", padx=(0, 20))
+            
+            method = sale.get('payment_info', {}).get('method', 'USD')
+            CustomLabel(info_frame, method, label_type="normal").pack(side="left")
+            
+            # Botón ver detalles
+            CustomButton(sale_frame, "👁️ Ver", 
+                        command=lambda s=sale: self._view_sale_details(s), 
+                        button_type="primary").pack(side="right", padx=10, pady=5)
+            
+            total_amount += sale['total']
+        
+        # Actualizar resumen
+        self.summary_label.config(text=f"Total: ${total_amount:.2f} | Ventas: {len(sales)}")
+    
+    def _view_sale_details(self, sale):
+        """Muestra los detalles de una venta"""
+        # Obtener la tasa de cambio de la venta o usar la actual
+        exchange_rate = sale.get('exchange_rate', 36.0)  # Valor por defecto
+        
+        receipt_dialog = ReceiptDialog(self.window, sale, exchange_rate)
+        self.window.wait_window(receipt_dialog.window)
+
+# Clase principal del sistema POS
+class POSSystem:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("🛒 Sistema POS - Venezuela")
+        self.root.geometry("1200x800")
+        self.root.state('zoomed')  # Maximizar en Windows
+        
+        # Inicializar componentes
+        self.style_manager = StyleManager()
+        self.exchange_manager = ExchangeManager()
+        self.inventory_manager = InventoryManager()
+        self.sales_manager = SalesManager()
+        
+        # Variables de la aplicación
+        self.current_cart = []
+        self.current_total = 0.0
+        
+        # Configurar la interfaz
+        self.setup_ui()
+        
+        # Actualizar tasa de cambio al inicio
+        self.exchange_manager.update_exchange_rate()
+        self.update_exchange_display()
+        
+        # Configurar actualización automática cada 5 minutos
+        self.schedule_exchange_update()
+    
+    def setup_ui(self):
+        """Configura la interfaz principal"""
+        self.root.configure(bg=self.style_manager.colors["bg_primary"])
+        
+        # Barra superior
+        self.setup_top_bar()
+        
+        # Contenido principal
+        main_container = CustomFrame(self.root)
+        main_container.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # Panel izquierdo (Productos)
+        self.setup_products_panel(main_container)
+        
+        # Panel derecho (Carrito y totales)
+        self.setup_cart_panel(main_container)
+        
+        # Barra inferior
+        self.setup_bottom_bar()
+    
+    def setup_top_bar(self):
+        """Configura la barra superior"""
+        top_bar = CustomFrame(self.root, frame_type="card")
+        top_bar.pack(fill="x", padx=10, pady=(10, 0))
+        
+        # Título
+        title_frame = CustomFrame(top_bar)
+        title_frame.pack(side="left", padx=20, pady=10)
+        
+        CustomLabel(title_frame, "🛒 Sistema POS", label_type="title").pack()
+        CustomLabel(title_frame, "Venezuela", label_type="subtitle").pack()
+        
+        # Información de tasa de cambio
+        exchange_frame = CustomFrame(top_bar)
+        exchange_frame.pack(side="right", padx=20, pady=10)
+        
+        self.exchange_label = CustomLabel(exchange_frame, "Cargando tasa...", label_type="large")
+        self.exchange_label.pack()
+        
+        CustomButton(exchange_frame, "🔄 Actualizar", 
+                    command=self.update_exchange_rate, 
+                    button_type="secondary").pack(pady=(5, 0))
+    
+    def setup_products_panel(self, parent):
+        """Configura el panel de productos"""
+        products_frame = CustomFrame(parent, frame_type="card")
+        products_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        
+        # Header del panel
+        header_frame = CustomFrame(products_frame)
+        header_frame.pack(fill="x", padx=20, pady=(20, 10))
+        
+        CustomLabel(header_frame, "📦 Productos", label_type="subtitle").pack(side="left")
+        
+        # Botones de gestión
+        buttons_frame = CustomFrame(header_frame)
+        buttons_frame.pack(side="right")
+        
+        CustomButton(buttons_frame, "➕ Agregar", 
+                    command=self.add_product_dialog, 
+                    button_type="success").pack(side="left", padx=2)
+        
+        CustomButton(buttons_frame, "🔄 Actualizar", 
+                    command=self.refresh_products, 
+                    button_type="secondary").pack(side="left", padx=2)
+        
+        # Barra de búsqueda
+        search_frame = CustomFrame(products_frame)
+        search_frame.pack(fill="x", padx=20, pady=(0, 10))
+        
+        CustomLabel(search_frame, "🔍 Buscar:", label_type="normal").pack(side="left")
+        
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', self.filter_products)
+        search_entry = tk.Entry(search_frame, textvariable=self.search_var, 
+                               font=self.style_manager.fonts["normal"], width=30)
+        search_entry.pack(side="left", padx=(10, 0), fill="x", expand=True)
+        
+        # Lista de productos con scroll
+        list_container = CustomFrame(products_frame)
+        list_container.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        
+        canvas = tk.Canvas(list_container, bg=self.style_manager.colors["bg_primary"])
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        self.products_list_frame = CustomFrame(canvas)
+        
+        self.products_list_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=self.products_list_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Cargar productos
+        self.refresh_products()
+    
+    def setup_cart_panel(self, parent):
+        """Configura el panel del carrito"""
+        cart_frame = CustomFrame(parent, frame_type="card")
+        cart_frame.pack(side="right", fill="y", padx=(10, 0))
+        cart_frame.configure(width=400)
+        cart_frame.pack_propagate(False)
+        
+        # Header del carrito
+        header_frame = CustomFrame(cart_frame)
+        header_frame.pack(fill="x", padx=20, pady=(20, 10))
+        
+        CustomLabel(header_frame, "🛒 Carrito de Compras", label_type="subtitle").pack()
+        
+        # Lista del carrito con scroll
+        cart_container = CustomFrame(cart_frame)
+        cart_container.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        
+        canvas = tk.Canvas(cart_container, bg=self.style_manager.colors["bg_primary"], height=300)
+        scrollbar = ttk.Scrollbar(cart_container, orient="vertical", command=canvas.yview)
+        self.cart_list_frame = CustomFrame(canvas)
+        
+        self.cart_list_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=self.cart_list_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        # Totales
+        totals_frame = CustomFrame(cart_frame, frame_type="card")
+        totals_frame.pack(fill="x", padx=20, pady=10)
+        
+        self.subtotal_label = CustomLabel(totals_frame, "Subtotal: $0.00", label_type="normal")
+        self.subtotal_label.pack(pady=5)
+        
+        self.total_usd_label = CustomLabel(totals_frame, "Total USD: $0.00", label_type="large")
+        self.total_usd_label.pack(pady=5)
+        
+        self.total_ves_label = CustomLabel(totals_frame, "Total VES: Bs. 0.00", label_type="large")
+        self.total_ves_label.pack(pady=5)
+        
+        # Botones de acción
+        actions_frame = CustomFrame(cart_frame)
+        actions_frame.pack(fill="x", padx=20, pady=(0, 20))
+        
+        CustomButton(actions_frame, "💰 Descuento", 
+                    command=self.apply_discount, 
+                    button_type="warning").pack(fill="x", pady=2)
+        
+        CustomButton(actions_frame, "🗑️ Limpiar Carrito", 
+                    command=self.clear_cart, 
+                    button_type="danger").pack(fill="x", pady=2)
+        
+        CustomButton(actions_frame, "💳 Procesar Pago", 
+                    command=self.process_payment, 
+                    button_type="success").pack(fill="x", pady=2)
+        
+        # Inicializar carrito vacío
+        self.update_cart_display()
+    
+    def setup_bottom_bar(self):
+        """Configura la barra inferior"""
+        bottom_bar = CustomFrame(self.root, frame_type="card")
+        bottom_bar.pack(fill="x", padx=10, pady=(0, 10))
+        
+        # Información del sistema
+        info_frame = CustomFrame(bottom_bar)
+        info_frame.pack(side="left", padx=20, pady=10)
+        
+        from datetime import datetime
+        current_time = datetime.now().strftime("%d/%m/%Y %H:%M")
+        CustomLabel(info_frame, f"📅 {current_time}", label_type="small").pack()
+        
+        # Botones de gestión
+        management_frame = CustomFrame(bottom_bar)
+        management_frame.pack(side="right", padx=20, pady=10)
+        
+        CustomButton(management_frame, "📊 Historial", 
+                    command=self.show_sales_history, 
+                    button_type="primary").pack(side="left", padx=2)
+        
+        CustomButton(management_frame, "📋 Inventario", 
+                    command=self.show_inventory_management, 
+                    button_type="primary").pack(side="left", padx=2)
+        
+        CustomButton(management_frame, "⚙️ Configuración", 
+                    command=self.show_settings, 
+                    button_type="secondary").pack(side="left", padx=2)
+    
+    def refresh_products(self):
+        """Actualiza la lista de productos"""
+        # Limpiar lista actual
+        for widget in self.products_list_frame.winfo_children():
+            widget.destroy()
+        
+        products = self.inventory_manager.get_all_products()
+        
+        if not products:
+            CustomLabel(self.products_list_frame, "No hay productos disponibles", 
+                       label_type="normal").pack(pady=20)
+            return
+        
+        for product in products:
+            self.create_product_card(product)
+    
+    def create_product_card(self, product):
+        """Crea una tarjeta de producto"""
+        card_frame = CustomFrame(self.products_list_frame, frame_type="card")
+        card_frame.pack(fill="x", pady=5, padx=5)
+        
+        # Información del producto
+        info_frame = CustomFrame(card_frame)
+        info_frame.pack(side="left", fill="x", expand=True, padx=15, pady=10)
+        
+        # Nombre y stock
+        name_frame = CustomFrame(info_frame)
+        name_frame.pack(fill="x")
+        
+        CustomLabel(name_frame, product['name'], label_type="normal").pack(side="left")
+        
+        stock_color = "success" if product['stock'] > 5 else "warning" if product['stock'] > 0 else "danger"
+        stock_text = f"Stock: {product['stock']}"
+        
+        stock_label = CustomLabel(name_frame, stock_text, label_type="small")
+        stock_label.pack(side="right")
+        
+        # Precios
+        price_usd = product['price_usd']
+        price_ves = self.exchange_manager.convert_usd_to_ves(price_usd)
+        
+        CustomLabel(info_frame, f"${price_usd:.2f} | Bs. {price_ves:,.2f}", 
+                   label_type="normal").pack(anchor="w")
+        
+        # Botones de acción
+        buttons_frame = CustomFrame(card_frame)
+        buttons_frame.pack(side="right", padx=15, pady=10)
+        
+        if product['stock'] > 0:
+            CustomButton(buttons_frame, "➕", 
+                        command=lambda p=product: self.add_to_cart(p), 
+                        button_type="success").pack(pady=1)
+        else:
+            CustomButton(buttons_frame, "❌", 
+                        command=None, 
+                        button_type="danger", state="disabled").pack(pady=1)
+        
+        CustomButton(buttons_frame, "✏️", 
+                    command=lambda p=product: self.edit_product(p), 
+                    button_type="secondary").pack(pady=1)
+    
+    def filter_products(self, *args):
+        """Filtra productos por búsqueda"""
+        search_term = self.search_var.get().lower()
+        
+        # Limpiar lista actual
+        for widget in self.products_list_frame.winfo_children():
+            widget.destroy()
+        
+        products = self.inventory_manager.get_all_products()
+        filtered_products = [p for p in products if search_term in p['name'].lower()]
+        
+        if not filtered_products:
+            CustomLabel(self.products_list_frame, "No se encontraron productos", 
+                       label_type="normal").pack(pady=20)
+            return
+        
+        for product in filtered_products:
+            self.create_product_card(product)
+    
+    def add_to_cart(self, product):
+        """Agrega un producto al carrito"""
+        # Verificar stock
+        if product['stock'] <= 0:
+            messagebox.showwarning("Sin Stock", f"El producto '{product['name']}' no tiene stock disponible")
+            return
+        
+        # Buscar si el producto ya está en el carrito
+        for item in self.current_cart:
+            if item['id'] == product['id']:
+                if item['quantity'] < product['stock']:
+                    item['quantity'] += 1
+                    item['total_price'] = item['quantity'] * item['unit_price']
+                else:
+                    messagebox.showwarning("Stock Insuficiente", 
+                                         f"No hay suficiente stock para '{product['name']}'")
+                    return
+                break
+        else:
+            # Producto nuevo en el carrito
+            cart_item = {
+                'id': product['id'],
+                'name': product['name'],
+                'unit_price': product['price_usd'],
+                'quantity': 1,
+                'total_price': product['price_usd'],
+                'max_stock': product['stock']
+            }
+            self.current_cart.append(cart_item)
+        
+        self.update_cart_display()
+        self.calculate_totals()
+    
+    def update_cart_display(self):
+        """Actualiza la visualización del carrito"""
+        # Limpiar carrito actual
+        for widget in self.cart_list_frame.winfo_children():
+            widget.destroy()
+        
+        if not self.current_cart:
+            CustomLabel(self.cart_list_frame, "Carrito vacío", 
+                       label_type="normal").pack(pady=20)
+            return
+        
+        for item in self.current_cart:
+            self.create_cart_item(item)
+    
+    def create_cart_item(self, item):
+        """Crea un elemento del carrito"""
+        item_frame = CustomFrame(self.cart_list_frame, frame_type="card")
+        item_frame.pack(fill="x", pady=2, padx=5)
+        
+        # Información del producto
+        info_frame = CustomFrame(item_frame)
+        info_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Nombre
+        CustomLabel(info_frame, item['name'], label_type="normal").pack(anchor="w")
+        
+        # Precio unitario
+        CustomLabel(info_frame, f"${item['unit_price']:.2f} c/u", 
+                   label_type="small").pack(anchor="w")
+        
+        # Controles de cantidad
+        quantity_frame = CustomFrame(info_frame)
+        quantity_frame.pack(fill="x", pady=(5, 0))
+        
+        # Botón disminuir
+        CustomButton(quantity_frame, "➖", 
+                    command=lambda i=item: self.decrease_quantity(i), 
+                    button_type="warning").pack(side="left")
+        
+        # Cantidad actual
+        CustomLabel(quantity_frame, f"  {item['quantity']}  ", 
+                   label_type="normal").pack(side="left")
+        
+        # Botón aumentar
+        CustomButton(quantity_frame, "➕", 
+                    command=lambda i=item: self.increase_quantity(i), 
+                    button_type="success").pack(side="left")
+        
+        # Total del item
+        CustomLabel(quantity_frame, f"${item['total_price']:.2f}", 
+                   label_type="normal").pack(side="right")
+        
+        # Botón eliminar
+        CustomButton(quantity_frame, "🗑️", 
+                    command=lambda i=item: self.remove_from_cart(i), 
+                    button_type="danger").pack(side="right", padx=(10, 0))
+    
+    def increase_quantity(self, item):
+        """Aumenta la cantidad de un producto en el carrito"""
+        if item['quantity'] < item['max_stock']:
+            item['quantity'] += 1
+            item['total_price'] = item['quantity'] * item['unit_price']
+            self.update_cart_display()
+            self.calculate_totals()
+        else:
+            messagebox.showwarning("Stock Insuficiente", 
+                                 f"No hay más stock disponible para '{item['name']}'")
+    
+    def decrease_quantity(self, item):
+        """Disminuye la cantidad de un producto en el carrito"""
+        if item['quantity'] > 1:
+            item['quantity'] -= 1
+            item['total_price'] = item['quantity'] * item['unit_price']
+            self.update_cart_display()
+            self.calculate_totals()
+        else:
+            self.remove_from_cart(item)
+    
+    def remove_from_cart(self, item):
+        """Elimina un producto del carrito"""
+        self.current_cart.remove(item)
+        self.update_cart_display()
+        self.calculate_totals()
+    
+    def clear_cart(self):
+        """Limpia todo el carrito"""
+        if self.current_cart:
+            if messagebox.askyesno("Confirmar", "¿Está seguro de que desea limpiar el carrito?"):
+                self.current_cart.clear()
+                self.update_cart_display()
+                self.calculate_totals()
+    
+    def calculate_totals(self):
+        """Calcula y actualiza los totales"""
+        subtotal = sum(item['total_price'] for item in self.current_cart)
+        self.current_total = subtotal
+        
+        # Actualizar labels
+        self.subtotal_label.config(text=f"Subtotal: ${subtotal:.2f}")
+        self.total_usd_label.config(text=f"Total USD: ${self.current_total:.2f}")
+        
+        total_ves = self.exchange_manager.convert_usd_to_ves(self.current_total)
+        self.total_ves_label.config(text=f"Total VES: Bs. {total_ves:,.2f}")
+    
+    def apply_discount(self):
+        """Aplica un descuento al total"""
+        if not self.current_cart:
+            messagebox.showwarning("Carrito Vacío", "No hay productos en el carrito")
+            return
+        
+        discount_dialog = DiscountDialog(self.root, self.current_total)
+        self.root.wait_window(discount_dialog.window)
+        
+        if discount_dialog.result and discount_dialog.discount_percentage > 0:
+            discount_amount = self.current_total * (discount_dialog.discount_percentage / 100)
+            self.current_total -= discount_amount
+            
+            # Actualizar displays
+            self.total_usd_label.config(text=f"Total USD: ${self.current_total:.2f} (Desc. {discount_dialog.discount_percentage}%)")
+            total_ves = self.exchange_manager.convert_usd_to_ves(self.current_total)
+            self.total_ves_label.config(text=f"Total VES: Bs. {total_ves:,.2f}")
+    
+    def process_payment(self):
+        """Procesa el pago de la venta"""
+        if not self.current_cart:
+            messagebox.showwarning("Carrito Vacío", "No hay productos en el carrito")
+            return
+        
+        # Diálogo de pago
+        payment_dialog = PaymentDialog(self.root, self.current_total, self.exchange_manager)
+        self.root.wait_window(payment_dialog.window)
+        
+        if payment_dialog.result and payment_dialog.payment_data:
+            # Procesar la venta
+            sale_data = {
+                'items': self.current_cart.copy(),
+                'subtotal': sum(item['total_price'] for item in self.current_cart),
+                'total': self.current_total,
+                'payment_info': payment_dialog.payment_data,
+                'exchange_rate': self.exchange_manager.current_rate
+            }
+            
+            # Guardar la venta
+            sale_id = self.sales_manager.record_sale(sale_data)
+            
+            # Actualizar inventario
+            for item in self.current_cart:
+                self.inventory_manager.update_stock(item['id'], -item['quantity'])
+            
+            # Mostrar recibo
+            sale_record = self.sales_manager.get_sale(sale_id)
+            receipt_dialog = ReceiptDialog(self.root, sale_record, self.exchange_manager.current_rate)
+            self.root.wait_window(receipt_dialog.window)
+            
+            # Limpiar carrito y actualizar displays
+            self.current_cart.clear()
+            self.current_total = 0.0
+            self.update_cart_display()
+            self.calculate_totals()
+            self.refresh_products()
+            
+            messagebox.showinfo("Venta Completada", f"Venta #{sale_id} procesada exitosamente")
+    
+    def add_product_dialog(self):
+        """Muestra el diálogo para agregar productos"""
+        dialog = AddProductDialog(self.root, self.exchange_manager)
+        self.root.wait_window(dialog.window)
+        
+        if dialog.result and dialog.product_data:
+            product_id = self.inventory_manager.add_product(dialog.product_data)
+            if product_id:
+                messagebox.showinfo("Producto Agregado", 
+                                  f"Producto '{dialog.product_data['name']}' agregado exitosamente")
+                self.refresh_products()
+            else:
+                messagebox.showerror("Error", "No se pudo agregar el producto")
+    
+    def edit_product(self, product):
+        """Edita un producto existente"""
+        # Por simplicidad, mostraremos un diálogo básico
+        messagebox.showinfo("Función no implementada", 
+                           f"Edición de '{product['name']}' no implementada en esta versión")
+    
+    def show_sales_history(self):
+        """Muestra el historial de ventas"""
+        history_dialog = SalesHistoryDialog(self.root, self.sales_manager)
+        self.root.wait_window(history_dialog.window)
+    
+    def show_inventory_management(self):
+        """Muestra la gestión de inventario"""
+        messagebox.showinfo("Función no implementada", 
+                           "Gestión de inventario no implementada en esta versión")
+    
+    def show_settings(self):
+        """Muestra la configuración del sistema"""
+        messagebox.showinfo("Función no implementada", 
+                           "Configuración no implementada en esta versión")
+    
+    def update_exchange_rate(self):
+        """Actualiza la tasa de cambio manualmente"""
+        self.exchange_manager.update_exchange_rate()
+        self.update_exchange_display()
+        self.calculate_totals()  # Recalcular totales con nueva tasa
+        messagebox.showinfo("Tasa Actualizada", 
+                           f"Nueva tasa: 1 USD = {self.exchange_manager.current_rate:,.2f} VES")
+    
+    def update_exchange_display(self):
+        """Actualiza la visualización de la tasa de cambio"""
+        rate = self.exchange_manager.get_rate_info()['rate']
+        self.exchange_label.config(text=f"💱 1 USD = {rate:,.2f} VES")
+    
+    def schedule_exchange_update(self):
+        """Programa la actualización automática de la tasa de cambio"""
+        self.exchange_manager.update_exchange_rate()
+        self.update_exchange_display()
+        
+        # Programar próxima actualización en 5 minutos (300000 ms)
+        self.root.after(300000, self.schedule_exchange_update)
+    
+    def run(self):
+        """Ejecuta la aplicación"""
+        try:
+            self.root.mainloop()
+        except KeyboardInterrupt:
+            print("Aplicación cerrada por el usuario")
+        except Exception as e:
+            messagebox.showerror("Error Fatal", f"Error inesperado: {str(e)}")
+
+# Función principal
+def main():
+    """Función principal del programa"""
+    try:
+        # Crear directorios necesarios
+        import os
+        os.makedirs("data", exist_ok=True)
+        
+        # Inicializar y ejecutar la aplicación
+        app = POSSystem()
+        app.run()
+        
+    except Exception as e:
+        print(f"Error al inicializar la aplicación: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
