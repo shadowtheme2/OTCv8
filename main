@@ -229,7 +229,7 @@ class StyleManager:
             QLabel {{
                 color: {self.colors['primary']};
                 font-weight: bold;
-                font-size: 16px;
+                font-size: 11px;
             }}
             """
         elif label_type == "subtitle":
