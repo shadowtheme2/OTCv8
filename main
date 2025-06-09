@@ -2475,7 +2475,7 @@ class MainWindow(QMainWindow):
         
         stock_input = QSpinBox()
         stock_input.setRange(0, 9999)
-        stock_input.setValue(stock)
+        stock_input.setValue(int(stock))
         stock_input.setStyleSheet(self.style_manager.get_input_style())
         
         # Agregar campos al formulario
