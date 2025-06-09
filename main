@@ -2827,7 +2827,10 @@ class MainWindow(QMainWindow):
         """Muestra el historial de ventas"""
         dialog = QDialog(self)
         dialog.setWindowTitle("Historial de Ventas")
-        dialog.setMinimumSize(800, 600)
+        
+        # Ajustar tamaño para pantalla 720p (1280x720)
+        dialog.setMinimumSize(950, 610)
+        dialog.resize(950, 610)
         dialog.setStyleSheet(self.style_manager.get_dialog_style())
         
         layout = QVBoxLayout()
@@ -2874,13 +2877,34 @@ class MainWindow(QMainWindow):
         
         layout.addWidget(filter_frame)
         
-        # Tabla de ventas
+        # Tabla de ventas - Optimizada para 720p
         self.sales_table = QTableWidget()
         self.sales_table.setStyleSheet(self.style_manager.get_table_style())
+        
+        # Establecer tamaño mínimo para la tabla
+        self.sales_table.setMinimumSize(900, 400)
+        
         self.sales_table.setColumnCount(6)
-        self.sales_table.setHorizontalHeaderLabels(["ID", "Fecha", "Método", "Total USD", "Total BS", "Acciones"])
-        self.sales_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.sales_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.sales_table.setHorizontalHeaderLabels(["ID", "Fecha", "Método", "Total USD", "Total BS", " ------------ ⚙️ Acciones ------------ "])
+        
+        # Configurar anchos de columnas específicos para 720p
+        header = self.sales_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)  # ID
+        header.setSectionResizeMode(1, QHeaderView.Stretch)  # Fecha
+        header.setSectionResizeMode(2, QHeaderView.Fixed)  # Método
+        header.setSectionResizeMode(3, QHeaderView.Fixed)  # Total USD
+        header.setSectionResizeMode(4, QHeaderView.Fixed)  # Total BS
+        header.setSectionResizeMode(5, QHeaderView.Fixed)  # Acciones
+        
+        # Establecer anchos específicos para cada columna
+        self.sales_table.setColumnWidth(0, 80)   # ID
+        self.sales_table.setColumnWidth(2, 120)  # Método de pago
+        self.sales_table.setColumnWidth(3, 120)  # Total USD
+        self.sales_table.setColumnWidth(4, 120)  # Total BS
+        self.sales_table.setColumnWidth(5, 150)  # Acciones
+        
+        # Configurar altura de filas
+        self.sales_table.verticalHeader().setDefaultSectionSize(55)
         
         layout.addWidget(self.sales_table)
         
@@ -2926,6 +2950,7 @@ class MainWindow(QMainWindow):
         self.load_sales_history(dialog)
         
         dialog.exec_()
+
 
     def load_sales_history(self, dialog):
         """Carga el historial de ventas según los filtros"""
