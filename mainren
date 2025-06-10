@@ -834,13 +834,24 @@ class ExchangeRateManager(QObject):
     def __init__(self):
         super().__init__()
         self.current_rate = 36.0  # Tasa por defecto
+        self.last_update = None  # Agregar seguimiento de última actualización
+        self.update_interval = 300  # 5 minutos en segundos
+        
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_rate)
         self.timer.start(300000)  # Actualizar cada 5 minutos
         
         # Actualizar inmediatamente
         QTimer.singleShot(1000, self.update_rate)
-
+    
+    def should_update(self):
+        """Verifica si debe actualizar la tasa de cambio"""
+        if self.last_update is None:
+            return True
+        
+        time_since_update = (datetime.now() - self.last_update).total_seconds()
+        return time_since_update >= self.update_interval
+    
     def update_rate(self):
         """Actualiza la tasa de cambio desde la API"""
         def fetch_rate():
@@ -869,6 +880,7 @@ class ExchangeRateManager(QObject):
                                 
                                 if new_rate > 0:
                                     self.current_rate = new_rate
+                                    self.last_update = datetime.now()  # Actualizar timestamp
                                     self.rate_updated.emit(new_rate)
                                     return
                     except:
@@ -884,16 +896,35 @@ class ExchangeRateManager(QObject):
         thread = threading.Thread(target=fetch_rate)
         thread.daemon = True
         thread.start()
-
+    
     def get_rate(self):
         """Obtiene la tasa actual"""
         return self.current_rate
-
+    
     def set_rate(self, rate):
         """Establece manualmente la tasa"""
         if rate > 0:
             self.current_rate = rate
+            self.last_update = datetime.now()  # Actualizar timestamp
             self.rate_updated.emit(rate)
+    
+    def force_update(self):
+        """Fuerza una actualización inmediata"""
+        self.last_update = None
+        self.update_rate()
+    
+    def get_last_update(self):
+        """Obtiene la fecha/hora de la última actualización"""
+        return self.last_update
+    
+    def is_rate_fresh(self):
+        """Verifica si la tasa es reciente (menos de 1 hora)"""
+        if self.last_update is None:
+            return False
+        
+        time_since_update = (datetime.now() - self.last_update).total_seconds()
+        return time_since_update < 3600  # 1 hora
+
 
 # ==================== DIÁLOGOS DE PRODUCTOS Y VENTAS ====================
 # ==================== CORRECCIÓN EN ProductDialog ====================
@@ -2067,6 +2098,7 @@ class MainWindow(QMainWindow):
         self.exchange_rate_manager.error_occurred.connect(self.on_rate_error)
         
         self.setup_ui()
+        self.create_dashboard_labels()  # ← LLAMAR AQUÍ
         self.load_data()
         
         # Timer para actualizar la interfaz
@@ -2104,6 +2136,21 @@ class MainWindow(QMainWindow):
         
         # Configurar barra de estado
         self.setup_status_bar()
+
+    def create_dashboard_labels(self):  # ← AGREGAR ESTE MÉTODO AQUÍ
+        """Create the missing dashboard labels"""
+        # Crear las etiquetas que faltan
+        self.monthly_sales_label = QLabel("$0.00")
+        self.monthly_sales_label.setStyleSheet(self.style_manager.get_label_style('title'))
+        
+        self.daily_sales_label = QLabel("$0.00") 
+        self.daily_sales_label.setStyleSheet(self.style_manager.get_label_style('title'))
+        
+        self.total_products_label = QLabel("0")
+        self.total_products_label.setStyleSheet(self.style_manager.get_label_style('title'))
+        
+        self.low_stock_label = QLabel("0")
+        self.low_stock_label.setStyleSheet(self.style_manager.get_label_style('warning'))
 
     def setup_menu(self):
         """Configura el menú principal"""
