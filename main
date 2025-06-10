@@ -1151,7 +1151,7 @@ class PaymentDialog(QDialog):
         total_ves_label.setStyleSheet(self.style_manager.get_label_style("subtitle"))
         total_ves_label.setAlignment(Qt.AlignCenter)
         
-        exchange_label = QLabel(f"Tasa BCV: {exchange_rate:.2f} BS/USD")
+        exchange_label = QLabel(f"💱 Tasa BCV: {exchange_rate:.2f} BS/USD")
         exchange_label.setStyleSheet(self.style_manager.get_label_style())
         exchange_label.setAlignment(Qt.AlignCenter)
         
@@ -1572,9 +1572,10 @@ class CartItem:
         return self.get_subtotal_ves() - self.get_cost_subtotal_ves()
     
     def get_display_text(self):
-        """Texto para mostrar en la lista del carrito"""
-        discount_text = f" (-{self.discount}%)" if self.discount > 0 else ""
-        return f"{self.name} x {self.quantity} = ${self.get_subtotal_usd():.2f} / Bs. {self.get_subtotal_ves():.2f}{discount_text}"
+        """Texto para mostrar en la lista del carrito 🛒"""
+        discount_text = f" 🏷️(-{self.discount}%)" if self.discount > 0 else ""
+        return f"📦 {self.name} x {self.quantity} = 💵${self.get_subtotal_usd():.2f} / 💰Bs. {self.get_subtotal_ves():.2f}{discount_text}"
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1682,7 +1683,8 @@ class MainWindow(QMainWindow):
         exchange_frame.setStyleSheet(self.style_manager.get_frame_style("section"))
         exchange_layout = QHBoxLayout(exchange_frame)
         
-        self.exchange_rate_label = QLabel(f"Tasa BCV: {self.exchange_rate_manager.get_current_rate():.2f} BS/USD")
+        self.exchange_rate_label = QLabel(f"💱 Tasa BCV: {self.exchange_rate_manager.get_current_rate():.2f} BS/USD")
+
         self.exchange_rate_label.setStyleSheet(self.style_manager.get_label_style("subtitle"))
         
         update_exchange_btn = QPushButton("Actualizar Tasa")
@@ -2586,7 +2588,7 @@ class MainWindow(QMainWindow):
 
     def update_exchange_rate_display(self, rate):
         """Actualiza la visualización de la tasa de cambio"""
-        self.exchange_rate_label.setText(f"Tasa BCV: {rate:.2f} BS/USD")
+        self.exchange_rate_label.setText(f"💱 Tasa BCV: {rate:.2f} BS/USD")
         # Recargar productos para actualizar precios
         self.load_products()
 
