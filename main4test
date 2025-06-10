@@ -1,0 +1,3133 @@
+import sys
+import json
+import sqlite3
+import requests
+import threading
+import uuid
+import os
+from datetime import datetime, timedelta
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter, A4, landscape
+from reportlab.platypus import Image
+
+# Configuración
+DATABASE_FILE = "pos_database.db"
+EXCHANGE_CONFIG = {
+    "primary_api": "https://api.exchangerate-api.com/v4/latest/USD",
+    "backup_api": "https://api.coindesk.com/v1/bpi/currentprice/VES.json",
+    "default_rate": 36.50,
+    "request_timeout": 10,
+    "update_interval": 300000  # 5 minutos
+}
+
+# Configuración de teclas de acceso rápido predeterminadas
+DEFAULT_SHORTCUTS = {
+    "search_products": "Ctrl+F",
+    "process_sale": "F12",
+    "add_product": "Ctrl+N",
+    "add_stock": "Ctrl+A",
+    "edit_product": "Ctrl+E",
+    "daily_report": "Ctrl+R",
+    "sales_history": "Ctrl+H"
+}
+
+class StyleManager:
+    def __init__(self):
+        self.colors = {
+            # Paleta principal más armoniosa
+            'primary': '#1e3a5f',      # Azul marino profundo
+            'secondary': '#2c5282',    # Azul medio
+            'accent': '#e53e3e',       # Rojo suave
+            'success': '#38a169',      # Verde esmeralda
+            'warning': '#d69e2e',      # Dorado suave
+            'info': '#3182ce',         # Azul información
+            'background': '#f7fafc',   # Gris muy claro
+            'surface': '#ffffff',      # Blanco puro
+            'text_primary': '#2d3748', # Gris oscuro
+            'text_secondary': '#4a5568', # Gris medio
+            'text_light': '#ffffff',   # Blanco
+            'border': '#e2e8f0',       # Gris claro
+            'hover': '#edf2f7',        # Gris hover
+            'selected': '#bee3f8'      # Azul claro selección
+        }
+        
+        self.fonts = {
+            'title': QFont("Segoe UI", 16, QFont.Bold),
+            'subtitle': QFont("Segoe UI", 12, QFont.Bold),
+            'normal': QFont("Segoe UI", 10),
+            'large': QFont("Segoe UI", 14, QFont.Bold),
+            'small': QFont("Segoe UI", 8)
+        }
+
+    def get_button_style(self, button_type="primary"):
+        """Retorna estilos para botones sin propiedades no compatibles"""
+        base_style = f"""
+            QPushButton {{
+                border: none;
+                padding: 10px 20px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 15px;
+                min-height: 20px;
+            }}
+            QPushButton:hover {{
+                opacity: 0.9;
+            }}
+            QPushButton:pressed {{
+                padding: 11px 19px 9px 21px;
+            }}
+            QPushButton:disabled {{
+                opacity: 0.5;
+            }}
+        """
+        
+        if button_type == "primary":
+            return base_style + f"""
+                QPushButton {{
+                    background-color: {self.colors['primary']};
+                    color: {self.colors['text_light']};
+                }}
+                QPushButton:hover {{
+                    background-color: {self.colors['secondary']};
+                }}
+            """
+        elif button_type == "success":
+            return base_style + f"""
+                QPushButton {{
+                    background-color: {self.colors['success']};
+                    color: {self.colors['text_light']};
+                }}
+                QPushButton:hover {{
+                    background-color: #2f855a;
+                }}
+            """
+        elif button_type == "warning":
+            return base_style + f"""
+                QPushButton {{
+                    background-color: {self.colors['warning']};
+                    color: {self.colors['text_light']};
+                }}
+                QPushButton:hover {{
+                    background-color: #b7791f;
+                }}
+            """
+        elif button_type == "accent":
+            return base_style + f"""
+                QPushButton {{
+                    background-color: {self.colors['accent']};
+                    color: {self.colors['text_light']};
+                }}
+                QPushButton:hover {{
+                    background-color: #c53030;
+                }}
+            """
+        else:
+            return base_style + f"""
+                QPushButton {{
+                    background-color: {self.colors['surface']};
+                    color: {self.colors['text_primary']};
+                    border: 2px solid {self.colors['border']};
+                }}
+                QPushButton:hover {{
+                    background-color: {self.colors['hover']};
+                }}
+            """
+
+    def get_input_style(self):
+        """Estilo para campos de entrada"""
+        return f"""
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+                background-color: {self.colors['surface']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 15px;
+                color: {self.colors['text_primary']};
+            }}
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+                border-color: {self.colors['primary']};
+                outline: none;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox::down-arrow {{
+                width: 12px;
+                height: 12px;
+            }}
+        """
+
+    def get_list_style(self):
+        """Estilo para listas"""
+        return f"""
+            QListWidget {{
+                background-color: {self.colors['surface']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 8px;
+                padding: 5px;
+                outline: none;
+            }}
+            QListWidget::item {{
+                background-color: {self.colors['surface']};
+                border: 1px solid {self.colors['border']};
+                border-radius: 4px;
+                padding: 8px;
+                margin: 2px;
+                color: {self.colors['text_primary']};
+            }}
+            QListWidget::item:selected {{
+                background-color: {self.colors['selected']};
+                border-color: {self.colors['primary']};
+            }}
+            QListWidget::item:hover {{
+                background-color: {self.colors['hover']};
+            }}
+        """
+
+    def get_frame_style(self, frame_type="default"):
+        """Estilo para frames/contenedores"""
+        if frame_type == "card":
+            return f"""
+                QFrame {{
+                    background-color: {self.colors['surface']};
+                    border: 2px solid {self.colors['border']};
+                    border-radius: 12px;
+                    padding: 15px;
+                }}
+            """
+        elif frame_type == "section":
+            return f"""
+                QFrame {{
+                    background-color: {self.colors['background']};
+                    border: 1px solid {self.colors['border']};
+                    border-radius: 8px;
+                    padding: 10px;
+                }}
+            """
+        else:
+            return f"""
+                QFrame {{
+                    background-color: {self.colors['surface']};
+                    border: none;
+                }}
+            """
+
+    def get_label_style(self, label_type="normal"):
+        """Estilo para etiquetas"""
+        if label_type == "title":
+            return f"""
+                QLabel {{
+                    color: {self.colors['primary']};
+                    font-weight: bold;
+                    font-size: 11px;
+                }}
+            """
+        elif label_type == "subtitle":
+            return f"""
+                QLabel {{
+                    color: {self.colors['text_primary']};
+                    font-weight: bold;
+                    font-size: 12px;
+                }}
+            """
+        elif label_type == "success":
+            return f"""
+                QLabel {{
+                    color: {self.colors['success']};
+                    font-weight: bold;
+                }}
+            """
+        elif label_type == "warning":
+            return f"""
+                QLabel {{
+                    color: {self.colors['warning']};
+                    font-weight: bold;
+                }}
+            """
+        elif label_type == "error":
+            return f"""
+                QLabel {{
+                    color: {self.colors['accent']};
+                    font-weight: bold;
+                }}
+            """
+        else:
+            return f"""
+                QLabel {{
+                    color: {self.colors['text_primary']};
+                }}
+            """
+
+    def get_dialog_style(self):
+        """Estilo para diálogos"""
+        return f"""
+            QDialog {{
+                background-color: {self.colors['surface']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 12px;
+            }}
+            QDialog QLabel {{
+                color: {self.colors['text_primary']};
+            }}
+        """
+
+    def get_table_style(self):
+        return f"""
+            QTableWidget {{
+                border: 2px solid {self.colors["border"]};
+                border-radius: 8px;
+                background-color: {self.colors["surface"]};
+                alternate-background-color: {self.colors["background"]};
+                selection-background-color: {self.colors["primary"]};
+                selection-color: white;
+                font-size: 14px;
+                gridline-color: {self.colors["border"]};
+            }}
+            QTableWidget::item {{
+                padding: 8px;
+                border: none;
+            }}
+            QTableWidget::item:hover {{
+                background-color: {self.colors["hover"]};
+            }}
+            QTableWidget::item:selected {{
+                background-color: {self.colors["primary"]};
+                color: white;
+            }}
+            QHeaderView::section {{
+                background-color: {self.colors["primary"]};
+                color: white;
+                padding: 10px;
+                border: none;
+                font-weight: bold;
+                font-size: 14px;
+            }}
+            QHeaderView::section:hover {{
+                background-color: #1E5F7A;
+            }}
+        """
+
+    def get_menu_style(self):
+        """Estilo para menús"""
+        return f"""
+            QMenuBar {{
+                background-color: {self.colors['primary']};
+                color: {self.colors['text_light']};
+                border-bottom: 2px solid {self.colors['border']};
+                padding: 4px;
+            }}
+            QMenuBar::item {{
+                background-color: transparent;
+                padding: 8px 16px;
+                border-radius: 4px;
+            }}
+            QMenuBar::item:selected {{
+                background-color: {self.colors['secondary']};
+            }}
+            QMenu {{
+                background-color: {self.colors['surface']};
+                color: {self.colors['text_primary']};
+                border: 2px solid {self.colors['border']};
+                border-radius: 6px;
+            }}
+            QMenu::item {{
+                padding: 8px 16px;
+                border-radius: 4px;
+                margin: 2px;
+            }}
+            QMenu::item:selected {{
+                background-color: {self.colors['selected']};
+            }}
+        """
+
+    def get_scrollbar_style(self):
+        """Estilo para barras de desplazamiento"""
+        return f"""
+            QScrollBar:vertical {{
+                background-color: {self.colors['background']};
+                width: 12px;
+                border-radius: 6px;
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {self.colors['border']};
+                border-radius: 6px;
+                min-height: 20px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background-color: {self.colors['text_secondary']};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0px;
+            }}
+        """
+
+class DatabaseManager:
+    def __init__(self):
+        self.db_file = DATABASE_FILE
+        self.init_database()
+        self.create_backup()
+
+    def init_database(self):
+        """Inicializa la base de datos"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        
+        # Tabla de productos
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price_ves REAL NOT NULL,
+                price_usd REAL NOT NULL,
+                stock REAL NOT NULL DEFAULT 0,
+                profit_percentage REAL DEFAULT 0,
+                cost_price_ves REAL DEFAULT 0,
+                cost_price_usd REAL DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Tabla de ventas con campo closed
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sales (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                total_usd REAL NOT NULL,
+                total_ves REAL NOT NULL,
+                payment_method TEXT NOT NULL,
+                usd_received REAL DEFAULT 0,
+                ves_received REAL DEFAULT 0,
+                usd_change REAL DEFAULT 0,
+                ves_change REAL DEFAULT 0,
+                exchange_rate REAL NOT NULL,
+                items TEXT NOT NULL,
+                discount_percentage REAL DEFAULT 0,
+                closed INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # Tabla de items de venta
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sale_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                product_name TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                price_usd REAL NOT NULL,
+                price_ves REAL NOT NULL,
+                cost_price_usd REAL NOT NULL,
+                cost_price_ves REAL NOT NULL,
+                discount_percentage REAL DEFAULT 0,
+                subtotal_usd REAL NOT NULL,
+                subtotal_ves REAL NOT NULL,
+                FOREIGN KEY (sale_id) REFERENCES sales (id),
+                FOREIGN KEY (product_id) REFERENCES products (id)
+            )
+        ''')
+        
+        # Agregar columnas para costos si no existen
+        try:
+            cursor.execute('ALTER TABLE products ADD COLUMN cost_price_ves REAL DEFAULT 0')
+            cursor.execute('ALTER TABLE products ADD COLUMN cost_price_usd REAL DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # Las columnas ya existen
+        
+        # Agregar columna closed si no existe
+        try:
+            cursor.execute('ALTER TABLE sales ADD COLUMN closed INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # La columna ya existe
+        
+        # Tabla de configuración
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        ''')
+        
+        # Tabla para atajos de teclado
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS shortcuts (
+                action TEXT PRIMARY KEY,
+                shortcut TEXT NOT NULL
+            )
+        ''')
+        
+        # Inicializar atajos de teclado si no existen
+        for action, shortcut in DEFAULT_SHORTCUTS.items():
+            cursor.execute('''
+                INSERT OR IGNORE INTO shortcuts (action, shortcut) VALUES (?, ?)
+            ''', (action, shortcut))
+        
+        conn.commit()
+        conn.close()
+
+    def create_backup(self):
+        """Crea backup temporal"""
+        try:
+            timestamp = datetime.now().isoformat()
+            backup_data = {
+                'timestamp': timestamp,
+                'products': self.get_products(),
+                'sales_count': len(self.get_daily_sales())
+            }
+            os.makedirs("backups", exist_ok=True)
+            with open(f"backups/backup_temp_{datetime.now().strftime('%Y%m%d')}.json", 'w') as f:
+                json.dump(backup_data, f, indent=2)
+        except Exception as e:
+            print(f"Error creando backup: {e}")
+
+    def add_product(self, name, price_ves, stock, profit_percentage=0, cost_price_ves=0, exchange_rate=36.50):
+        """Agrega un producto"""
+        try:
+            cost_price_usd = cost_price_ves / exchange_rate
+            final_price_ves = cost_price_ves * (1 + profit_percentage/100)
+            final_price_usd = final_price_ves / exchange_rate
+            
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO products (name, price_ves, price_usd, stock, profit_percentage, cost_price_ves, cost_price_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (name, final_price_ves, final_price_usd, stock, profit_percentage, cost_price_ves, cost_price_usd))
+            conn.commit()
+            conn.close()
+            self.create_backup()
+            return True
+        except Exception as e:
+            print(f"Error agregando producto: {e}")
+            return False
+
+    def update_product(self, product_id, name, price_ves, stock, profit_percentage, cost_price_ves, exchange_rate):
+        """Actualiza un producto"""
+        try:
+            cost_price_usd = cost_price_ves / exchange_rate
+            final_price_ves = cost_price_ves * (1 + profit_percentage/100)
+            final_price_usd = final_price_ves / exchange_rate
+            
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE products 
+                SET name=?, price_ves=?, price_usd=?, stock=?, profit_percentage=?, cost_price_ves=?, cost_price_usd=?
+                WHERE id=?
+            ''', (name, final_price_ves, final_price_usd, stock, profit_percentage, cost_price_ves, cost_price_usd, product_id))
+            conn.commit()
+            conn.close()
+            self.create_backup()
+            return True
+        except Exception as e:
+            print(f"Error actualizando producto: {e}")
+            return False
+
+    def add_stock(self, product_id, additional_stock):
+        """Agrega stock a un producto existente"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE products SET stock = stock + ? WHERE id = ?
+            ''', (additional_stock, product_id))
+            conn.commit()
+            conn.close()
+            self.create_backup()
+            return True
+        except Exception as e:
+            print(f"Error agregando stock: {e}")
+            return False
+
+    def get_products(self, search_term=""):
+        """Obtiene productos con búsqueda opcional"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        if search_term:
+            cursor.execute('''
+                SELECT * FROM products 
+                WHERE name LIKE ? OR id LIKE ? 
+                ORDER BY name
+            ''', (f'%{search_term}%', f'%{search_term}%'))
+        else:
+            cursor.execute('SELECT * FROM products ORDER BY name')
+        products = cursor.fetchall()
+        conn.close()
+        return products
+
+    def get_all_products(self):
+        """Obtiene todos los productos"""
+        return self.get_products()
+
+    def search_products(self, search_term):
+        """Busca productos por término"""
+        return self.get_products(search_term)
+
+    def get_product_by_id(self, product_id):
+        """Obtiene un producto por ID"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM products WHERE id = ?', (product_id,))
+        product = cursor.fetchone()
+        conn.close()
+        return product
+
+    def update_product_stock(self, product_id, new_stock):
+        """Actualiza el stock de un producto"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('UPDATE products SET stock = ? WHERE id = ?', (new_stock, product_id))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error actualizando stock: {e}")
+            return False
+
+    def delete_product(self, product_id):
+        """Elimina un producto"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM products WHERE id = ?', (product_id,))
+            conn.commit()
+            conn.close()
+            self.create_backup()
+            return True
+        except Exception as e:
+            print(f"Error eliminando producto: {e}")
+            return False
+
+    def record_sale(self, sale_data):
+        """Registra una venta"""
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            
+            # Insertar venta principal
+            cursor.execute('''
+                INSERT INTO sales (id, timestamp, total_usd, total_ves, payment_method, 
+                                 usd_received, ves_received, usd_change, ves_change, 
+                                 exchange_rate, items, discount_percentage)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                sale_data['id'], sale_data['timestamp'], sale_data['total_usd'],
+                sale_data['total_ves'], sale_data['payment_method'],
+                sale_data.get('usd_received', 0), sale_data.get('ves_received', 0),
+                sale_data.get('usd_change', 0), sale_data.get('ves_change', 0),
+                sale_data['exchange_rate'], json.dumps(sale_data['items']),
+                sale_data.get('discount_percentage', 0)
+            ))
+            
+            # Insertar items de venta
+            for item in sale_data['items']:
+                cursor.execute('''
+                    INSERT INTO sale_items (sale_id, product_id, product_name, quantity,
+                                          price_usd, price_ves, cost_price_usd, cost_price_ves,
+                                          discount_percentage, subtotal_usd, subtotal_ves)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    sale_data['id'], item['id'], item['name'], item['quantity'],
+                    item['price_usd'], item['price_ves'], item.get('cost_price_usd', 0),
+                    item.get('cost_price_ves', 0), item.get('discount_percentage', 0),
+                    item['subtotal_usd'], item['subtotal_ves']
+                ))
+                
+                # Actualizar stock
+                cursor.execute('''
+                    UPDATE products SET stock = stock - ? WHERE id = ?
+                ''', (item['quantity'], item['id']))
+            
+            conn.commit()
+            conn.close()
+            self.create_backup()
+            return True
+        except Exception as e:
+            print(f"Error registrando venta: {e}")
+            return False
+
+    def get_daily_sales(self, date=None):
+        """Obtiene ventas del día"""
+        if date is None:
+            date = datetime.now().strftime('%Y-%m-%d')
+        
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM sales 
+            WHERE date(timestamp) = ? AND closed = 0
+            ORDER BY timestamp DESC
+        ''', (date,))
+        sales = cursor.fetchall()
+        conn.close()
+        return sales
+
+    def get_all_sales(self):
+        """Obtiene todas las ventas"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM sales ORDER BY timestamp DESC')
+        sales = cursor.fetchall()
+        conn.close()
+        return sales
+
+    def get_sale_items(self, sale_id):
+        """Obtiene los items de una venta específica"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM sale_items WHERE sale_id = ?', (sale_id,))
+        items = cursor.fetchall()
+        conn.close()
+        return items
+
+    def close_daily_sales(self, date=None):
+        """Cierra las ventas del día"""
+        if date is None:
+            date = datetime.now().strftime('%Y-%m-%d')
+        
+        try:
+            conn = sqlite3.connect(self.db_file)
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE sales SET closed = 1 
+                WHERE date(timestamp) = ? AND closed = 0
+            ''', (date,))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"Error cerrando ventas del día: {e}")
+            return False
+
+    def get_config(self, key, default_value=""):
+        """Obtiene configuración"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM config WHERE key = ?', (key,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else default_value
+
+    def set_config(self, key, value):
+        """Establece configuración"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)
+        ''', (key, value))
+        conn.commit()
+        conn.close()
+
+    def get_shortcuts(self):
+        """Obtiene atajos de teclado"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM shortcuts')
+        shortcuts = dict(cursor.fetchall())
+        conn.close()
+        return shortcuts
+
+    def update_shortcut(self, action, shortcut):
+        """Actualiza un atajo de teclado"""
+        conn = sqlite3.connect(self.db_file)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO shortcuts (action, shortcut) VALUES (?, ?)
+        ''', (action, shortcut))
+        conn.commit()
+        conn.close()
+
+class ExchangeRateManager:
+    def __init__(self):
+        self.current_rate = EXCHANGE_CONFIG["default_rate"]
+        self.last_update = None
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.update_rate)
+        self.update_timer.start(EXCHANGE_CONFIG["update_interval"])
+        self.update_rate()
+
+    def update_rate(self):
+        """Actualiza la tasa de cambio desde APIs"""
+        def fetch_rate():
+            try:
+                # Intentar API principal
+                response = requests.get(
+                    EXCHANGE_CONFIG["primary_api"],
+                    timeout=EXCHANGE_CONFIG["request_timeout"]
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'rates' in data and 'VES' in data['rates']:
+                        self.current_rate = data['rates']['VES']
+                        self.last_update = datetime.now()
+                        return
+                
+                # Intentar API de respaldo
+                response = requests.get(
+                    EXCHANGE_CONFIG["backup_api"],
+                    timeout=EXCHANGE_CONFIG["request_timeout"]
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'bpi' in data and 'VES' in data['bpi']:
+                        self.current_rate = data['bpi']['VES']['rate_float']
+                        self.last_update = datetime.now()
+                        return
+                        
+            except Exception as e:
+                print(f"Error actualizando tasa de cambio: {e}")
+            
+            # Si fallan ambas APIs, usar tasa por defecto
+            if self.current_rate == 0:
+                self.current_rate = EXCHANGE_CONFIG["default_rate"]
+
+        # Ejecutar en hilo separado para no bloquear la UI
+        thread = threading.Thread(target=fetch_rate)
+        thread.daemon = True
+        thread.start()
+
+    def get_rate(self):
+        """Obtiene la tasa actual"""
+        return self.current_rate
+
+    def usd_to_ves(self, usd_amount):
+        """Convierte USD a VES"""
+        return usd_amount * self.current_rate
+
+    def ves_to_usd(self, ves_amount):
+        """Convierte VES a USD"""
+        return ves_amount / self.current_rate
+
+class ProductDialog(QDialog):
+    def __init__(self, parent=None, db_manager=None, exchange_rate=36.50, product=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.exchange_rate = exchange_rate
+        self.product = product  # Puede ser None para nuevo producto
+        self.style_manager = StyleManager()
+        self.init_ui()
+        
+        # Solo cargar datos si hay un producto para editar
+        if self.product is not None:
+            self.load_product_data()
+
+    def init_ui(self):
+        """Inicializa la interfaz de usuario"""
+        title = "Editar Producto" if self.product else "Agregar Producto"
+        self.setWindowTitle(title)
+        self.setFixedSize(500, 670)
+        self.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title_label = QLabel(title)
+        title_label.setStyleSheet(self.style_manager.get_label_style("title"))
+        title_label.setFont(self.style_manager.fonts['title'])
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Formulario
+        form_layout = QFormLayout()
+        
+        # Nombre del producto
+        self.name_input = QLineEdit()
+        self.name_input.setStyleSheet(self.style_manager.get_input_style())
+        self.name_input.setPlaceholderText("Nombre del producto")
+        form_layout.addRow("Nombre:", self.name_input)
+        
+        # Precios
+        price_frame = QFrame()
+        price_frame.setStyleSheet(self.style_manager.get_frame_style("section"))
+        price_layout = QVBoxLayout(price_frame)
+        
+        price_title = QLabel("Precios")
+        price_title.setStyleSheet(self.style_manager.get_label_style("subtitle"))
+        price_layout.addWidget(price_title)
+        
+        # Precio en USD
+        self.price_usd_input = QDoubleSpinBox()
+        self.price_usd_input.setStyleSheet(self.style_manager.get_input_style())
+        self.price_usd_input.setRange(0.01, 999999.99)
+        self.price_usd_input.setDecimals(2)
+        self.price_usd_input.setPrefix("$ ")
+        self.price_usd_input.valueChanged.connect(self.calculate_price_ves)
+        price_layout.addWidget(QLabel("Precio USD:"))
+        price_layout.addWidget(self.price_usd_input)
+        
+        # Precio en BS (calculado automáticamente)
+        self.price_ves_input = QDoubleSpinBox()
+        self.price_ves_input.setStyleSheet(self.style_manager.get_input_style())
+        self.price_ves_input.setRange(0.01, 999999999.99)
+        self.price_ves_input.setDecimals(2)
+        self.price_ves_input.setSuffix(" Bs")
+        price_layout.addWidget(QLabel("Precio BS:"))
+        price_layout.addWidget(self.price_ves_input)
+        
+        layout.addWidget(price_frame)
+        
+        # Costos
+        cost_frame = QFrame()
+        cost_frame.setStyleSheet(self.style_manager.get_frame_style("section"))
+        cost_layout = QVBoxLayout(cost_frame)
+        
+        cost_title = QLabel("Costos")
+        cost_title.setStyleSheet(self.style_manager.get_label_style("subtitle"))
+        cost_layout.addWidget(cost_title)
+        
+        # Costo en USD
+        self.cost_usd_input = QDoubleSpinBox()
+        self.cost_usd_input.setStyleSheet(self.style_manager.get_input_style())
+        self.cost_usd_input.setRange(0.00, 999999.99)
+        self.cost_usd_input.setDecimals(2)
+        self.cost_usd_input.setPrefix("$ ")
+        self.cost_usd_input.valueChanged.connect(self.calculate_cost_ves)
+        cost_layout.addWidget(QLabel("Costo USD:"))
+        cost_layout.addWidget(self.cost_usd_input)
+        
+        # Costo en BS
+        self.cost_ves_input = QDoubleSpinBox()
+        self.cost_ves_input.setStyleSheet(self.style_manager.get_input_style())
+        self.cost_ves_input.setRange(0.00, 999999999.99)
+        self.cost_ves_input.setDecimals(2)
+        self.cost_ves_input.setSuffix(" Bs")
+        cost_layout.addWidget(QLabel("Costo BS:"))
+        cost_layout.addWidget(self.cost_ves_input)
+        
+        layout.addWidget(cost_frame)
+        
+        # Stock inicial (solo para productos nuevos)
+        if not self.product:
+            self.stock_input = QDoubleSpinBox()
+            self.stock_input.setStyleSheet(self.style_manager.get_input_style())
+            self.stock_input.setRange(0.00, 999999.99)
+            self.stock_input.setDecimals(2)
+            form_layout.addRow("Stock Inicial:", self.stock_input)
+        
+        layout.addLayout(form_layout)
+        
+        # Información de ganancia
+        self.profit_label = QLabel("Ganancia: $0.00 (0.00%)")
+        self.profit_label.setStyleSheet(self.style_manager.get_label_style("info"))
+        self.profit_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.profit_label)
+        
+        # Conectar cambios para calcular ganancia
+        self.price_usd_input.valueChanged.connect(self.calculate_profit)
+        self.cost_usd_input.valueChanged.connect(self.calculate_profit)
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        save_btn = QPushButton("Guardar")
+        save_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+        save_btn.clicked.connect(self.save_product)
+        
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.setStyleSheet(self.style_manager.get_button_style())
+        cancel_btn.clicked.connect(self.reject)
+        
+        button_layout.addWidget(save_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+
+    def load_product_data(self):
+        """Carga los datos del producto para edición"""
+        if not self.product:
+            return
+            
+        self.name_input.setText(self.product[1])  # name
+        self.price_ves_input.setValue(self.product[2])  # price_ves
+        self.price_usd_input.setValue(self.product[3])  # price_usd
+        
+        # Cargar costos si existen
+        if len(self.product) > 6:
+            self.cost_ves_input.setValue(self.product[6])  # cost_ves
+        if len(self.product) > 7:
+            self.cost_usd_input.setValue(self.product[7])  # cost_usd
+        
+        # Calcular ganancia inicial
+        self.calculate_profit()
+
+    def calculate_price_ves(self):
+        """Calcula el precio en BS basado en USD"""
+        price_usd = self.price_usd_input.value()
+        price_ves = price_usd * self.exchange_rate
+        self.price_ves_input.setValue(price_ves)
+
+    def calculate_cost_ves(self):
+        """Calcula el costo en BS basado en USD"""
+        cost_usd = self.cost_usd_input.value()
+        cost_ves = cost_usd * self.exchange_rate
+        self.cost_ves_input.setValue(cost_ves)
+
+    def calculate_profit(self):
+        """Calcula y muestra la ganancia"""
+        price_usd = self.price_usd_input.value()
+        cost_usd = self.cost_usd_input.value()
+        
+        if cost_usd > 0:
+            profit_usd = price_usd - cost_usd
+            profit_percent = (profit_usd / cost_usd) * 100
+            self.profit_label.setText(f"Ganancia: ${profit_usd:.2f} ({profit_percent:.1f}%)")
+        else:
+            self.profit_label.setText("Ganancia: $0.00 (0.0%)")
+
+    def save_product(self):
+        """Guarda el producto"""
+        # Validar datos
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Error", "El nombre del producto es obligatorio")
+            return
+        
+        price_usd = self.price_usd_input.value()
+        if price_usd <= 0:
+            QMessageBox.warning(self, "Error", "El precio debe ser mayor a 0")
+            return
+        
+        try:
+            if self.product:  # Editar producto existente
+                self.db_manager.update_product(
+                    product_id=self.product[0],
+                    name=name,
+                    price_ves=self.price_ves_input.value(),
+                    price_usd=price_usd,
+                    cost_ves=self.cost_ves_input.value(),
+                    cost_usd=self.cost_usd_input.value()
+                )
+            else:  # Crear nuevo producto
+                stock = self.stock_input.value() if hasattr(self, 'stock_input') else 0
+                self.db_manager.add_product(
+                    name=name,
+                    price_ves=self.price_ves_input.value(),
+                    price_usd=price_ves,
+                    stock=stock,
+                    cost_ves=self.cost_ves_input.value(),
+                    cost_usd=self.cost_usd_input.value()
+                )
+            
+            self.accept()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error guardando producto: {e}")
+
+
+    def get_product_data(self):
+        """Retorna los datos del producto"""
+        return {
+            'name': self.name_input.text().strip(),
+            'cost_price_ves': self.cost_ves_input.value(),
+            'profit_percentage': self.profit_input.value(),
+            'stock': self.stock_input.value(),
+            'final_price_ves': self.final_price_ves_input.value(),
+            'exchange_rate': self.exchange_rate
+        }
+
+class AddStockDialog(QDialog):
+    def __init__(self, parent=None, product=None):
+        super().__init__(parent)
+        self.product = product
+        self.style_manager = StyleManager()
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Agregar Stock")
+        self.setFixedSize(400, 300)
+        self.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title = QLabel("Agregar Stock al Producto")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['title'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Información del producto
+        if self.product:
+            info_label = QLabel(f"Producto: {self.product[1]}\nStock actual: {self.product[4]}")
+            info_label.setStyleSheet(self.style_manager.get_label_style())
+            info_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(info_label)
+        
+        # Campo para cantidad adicional
+        form_layout = QFormLayout()
+        
+        self.stock_input = QDoubleSpinBox()
+        self.stock_input.setStyleSheet(self.style_manager.get_input_style())
+        self.stock_input.setRange(0.01, 999999.99)
+        self.stock_input.setDecimals(2)
+        self.stock_input.setValue(1.0)
+        form_layout.addRow("Cantidad a agregar:", self.stock_input)
+        
+        layout.addLayout(form_layout)
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        add_btn = QPushButton("Agregar Stock")
+        add_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+        add_btn.clicked.connect(self.accept)
+        
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.setStyleSheet(self.style_manager.get_button_style())
+        cancel_btn.clicked.connect(self.reject)
+        
+        button_layout.addWidget(add_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+
+    def get_additional_stock(self):
+        """Retorna la cantidad adicional de stock"""
+        return self.stock_input.value()
+
+class PaymentDialog(QDialog):
+    def __init__(self, parent=None, total_usd=0, total_ves=0, exchange_rate=36.50):
+        super().__init__(parent)
+        self.total_usd = total_usd
+        self.total_ves = total_ves
+        self.exchange_rate = exchange_rate
+        self.style_manager = StyleManager()
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Procesar Pago")
+        self.setFixedSize(500, 700)
+        self.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title = QLabel("Procesar Pago")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['title'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Información del total
+        total_info = QLabel(f"Total: ${self.total_usd:.2f} / {self.total_ves:.2f} Bs")
+        total_info.setStyleSheet(self.style_manager.get_label_style("subtitle"))
+        total_info.setAlignment(Qt.AlignCenter)
+        layout.addWidget(total_info)
+        
+        # Método de pago
+        payment_group = QGroupBox("Método de Pago")
+        payment_group.setStyleSheet(self.style_manager.get_frame_style("section"))
+        payment_layout = QVBoxLayout()
+        
+        self.payment_method = QButtonGroup()
+        
+        self.bs_radio = QRadioButton("Bolívares (BS)")
+        self.usd_radio = QRadioButton("Dólares (USD)")
+        self.mixed_radio = QRadioButton("Mixto (BS + USD)")
+        
+        self.bs_radio.setChecked(True)
+        
+        self.payment_method.addButton(self.bs_radio, 0)
+        self.payment_method.addButton(self.usd_radio, 1)
+        self.payment_method.addButton(self.mixed_radio, 2)
+        
+        payment_layout.addWidget(self.bs_radio)
+        payment_layout.addWidget(self.usd_radio)
+        payment_layout.addWidget(self.mixed_radio)
+        payment_group.setLayout(payment_layout)
+        layout.addWidget(payment_group)
+        
+        # Campos de pago
+        self.payment_fields = QStackedWidget()
+        
+        # Pago en BS
+        bs_widget = QWidget()
+        bs_layout = QFormLayout()
+        
+        self.bs_received_input = QDoubleSpinBox()
+        self.bs_received_input.setStyleSheet(self.style_manager.get_input_style())
+        self.bs_received_input.setRange(0, 999999.99)
+        self.bs_received_input.setDecimals(2)
+        self.bs_received_input.setSuffix(" Bs")
+        self.bs_received_input.setValue(self.total_ves)
+        self.bs_received_input.valueChanged.connect(self.calculate_bs_change)
+        bs_layout.addRow("Monto Recibido (BS):", self.bs_received_input)
+        
+        self.bs_change_label = QLabel("0.00 Bs")
+        self.bs_change_label.setStyleSheet(self.style_manager.get_label_style("success"))
+        bs_layout.addRow("Cambio (BS):", self.bs_change_label)
+        
+        bs_widget.setLayout(bs_layout)
+        self.payment_fields.addWidget(bs_widget)
+        
+        # Pago en USD
+        usd_widget = QWidget()
+        usd_layout = QFormLayout()
+        
+        self.usd_received_input = QDoubleSpinBox()
+        self.usd_received_input.setStyleSheet(self.style_manager.get_input_style())
+        self.usd_received_input.setRange(0, 999999.99)
+        self.usd_received_input.setDecimals(2)
+        self.usd_received_input.setSuffix(" $")
+        self.usd_received_input.setValue(self.total_usd)
+        self.usd_received_input.valueChanged.connect(self.calculate_usd_change)
+        usd_layout.addRow("Monto Recibido (USD):", self.usd_received_input)
+        
+        self.usd_change_input = QDoubleSpinBox()
+        self.usd_change_input.setStyleSheet(self.style_manager.get_input_style())
+        self.usd_change_input.setRange(0, 999999.99)
+        self.usd_change_input.setDecimals(2)
+        self.usd_change_input.setSuffix(" $")
+        self.usd_change_input.valueChanged.connect(self.calculate_usd_change_bs)
+        usd_layout.addRow("Cambio USD (Editable):", self.usd_change_input)
+        
+        self.usd_change_bs_label = QLabel("0.00 Bs")
+        self.usd_change_bs_label.setStyleSheet(self.style_manager.get_label_style("success"))
+        usd_layout.addRow("Cambio BS (Restante):", self.usd_change_bs_label)
+        
+        usd_widget.setLayout(usd_layout)
+        self.payment_fields.addWidget(usd_widget)
+        
+        # Pago Mixto
+        mixed_widget = QWidget()
+        mixed_layout = QFormLayout()
+        
+        self.mixed_bs_input = QDoubleSpinBox()
+        self.mixed_bs_input.setStyleSheet(self.style_manager.get_input_style())
+        self.mixed_bs_input.setRange(0, 999999.99)
+        self.mixed_bs_input.setDecimals(2)
+        self.mixed_bs_input.setSuffix(" Bs")
+        self.mixed_bs_input.valueChanged.connect(self.calculate_mixed_change)
+        mixed_layout.addRow("Monto BS:", self.mixed_bs_input)
+        
+        self.mixed_usd_input = QDoubleSpinBox()
+        self.mixed_usd_input.setStyleSheet(self.style_manager.get_input_style())
+        self.mixed_usd_input.setRange(0, 999999.99)
+        self.mixed_usd_input.setDecimals(2)
+        self.mixed_usd_input.setSuffix(" $")
+        self.mixed_usd_input.valueChanged.connect(self.calculate_mixed_change)
+        mixed_layout.addRow("Monto USD:", self.mixed_usd_input)
+        
+        self.mixed_change_usd_input = QDoubleSpinBox()
+        self.mixed_change_usd_input.setStyleSheet(self.style_manager.get_input_style())
+        self.mixed_change_usd_input.setRange(0, 999999.99)
+        self.mixed_change_usd_input.setDecimals(2)
+        self.mixed_change_usd_input.setSuffix(" $")
+        self.mixed_change_usd_input.valueChanged.connect(self.calculate_mixed_change_bs)
+        mixed_layout.addRow("Cambio USD (Editable):", self.mixed_change_usd_input)
+        
+        self.mixed_change_bs_label = QLabel("0.00 Bs")
+        self.mixed_change_bs_label.setStyleSheet(self.style_manager.get_label_style("success"))
+        mixed_layout.addRow("Cambio BS (Restante):", self.mixed_change_bs_label)
+        
+        mixed_widget.setLayout(mixed_layout)
+        self.payment_fields.addWidget(mixed_widget)
+        
+        layout.addWidget(self.payment_fields)
+        
+        # Conectar cambios de método de pago
+        self.bs_radio.toggled.connect(lambda: self.payment_fields.setCurrentIndex(0))
+        self.usd_radio.toggled.connect(lambda: self.payment_fields.setCurrentIndex(1))
+        self.mixed_radio.toggled.connect(lambda: self.payment_fields.setCurrentIndex(2))
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        process_btn = QPushButton("Procesar Pago")
+        process_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+        process_btn.clicked.connect(self.process_payment)
+        
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.setStyleSheet(self.style_manager.get_button_style())
+        cancel_btn.clicked.connect(self.reject)
+        
+        button_layout.addWidget(process_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+        
+        # Calcular cambios iniciales
+        self.calculate_bs_change()
+        self.calculate_usd_change()
+
+    def calculate_bs_change(self):
+        """Calcula el cambio en BS"""
+        received = self.bs_received_input.value()
+        change = max(0, received - self.total_ves)
+        self.bs_change_label.setText(f"{change:.2f} Bs")
+
+    def calculate_usd_change(self):
+        """Calcula el cambio en USD"""
+        received = self.usd_received_input.value()
+        total_change = max(0, received - self.total_usd)
+        self.usd_change_input.setValue(total_change)
+        self.calculate_usd_change_bs()
+
+    def calculate_usd_change_bs(self):
+        """Calcula el cambio restante en BS cuando se da cambio en USD"""
+        received = self.usd_received_input.value()
+        total_change = max(0, received - self.total_usd)
+        usd_change_given = self.usd_change_input.value()
+        
+        if usd_change_given <= total_change:
+            remaining_change_usd = total_change - usd_change_given
+            remaining_change_bs = remaining_change_usd * self.exchange_rate
+            self.usd_change_bs_label.setText(f"{remaining_change_bs:.2f} Bs")
+        else:
+            self.usd_change_bs_label.setText("0.00 Bs")
+
+    def calculate_mixed_change(self):
+        """Calcula el cambio para pago mixto"""
+        bs_received = self.mixed_bs_input.value()
+        usd_received = self.mixed_usd_input.value()
+        
+        total_received_usd = (bs_received / self.exchange_rate) + usd_received
+        total_change = max(0, total_received_usd - self.total_usd)
+        
+        self.mixed_change_usd_input.setValue(total_change)
+        self.calculate_mixed_change_bs()
+
+    def calculate_mixed_change_bs(self):
+        """Calcula el cambio restante en BS para pago mixto"""
+        bs_received = self.mixed_bs_input.value()
+        usd_received = self.mixed_usd_input.value()
+        
+        total_received_usd = (bs_received / self.exchange_rate) + usd_received
+        total_change = max(0, total_received_usd - self.total_usd)
+        usd_change_given = self.mixed_change_usd_input.value()
+        
+        if usd_change_given <= total_change:
+            remaining_change_usd = total_change - usd_change_given
+            remaining_change_bs = remaining_change_usd * self.exchange_rate
+            self.mixed_change_bs_label.setText(f"{remaining_change_bs:.2f} Bs")
+        else:
+            self.mixed_change_bs_label.setText("0.00 Bs")
+
+    def process_payment(self):
+        """Procesa el pago"""
+        method_id = self.payment_method.checkedId()
+        
+        if method_id == 0:  # BS
+            if self.bs_received_input.value() < self.total_ves:
+                QMessageBox.warning(self, "Error", "El monto recibido es insuficiente")
+                return
+        elif method_id == 1:  # USD
+            if self.usd_received_input.value() < self.total_usd:
+                QMessageBox.warning(self, "Error", "El monto recibido es insuficiente")
+                return
+        elif method_id == 2:  # Mixto
+            bs_received = self.mixed_bs_input.value()
+            usd_received = self.mixed_usd_input.value()
+            total_received_usd = (bs_received / self.exchange_rate) + usd_received
+            
+            if total_received_usd < self.total_usd:
+                QMessageBox.warning(self, "Error", "El monto total recibido es insuficiente")
+                return
+        
+        self.accept()
+
+    def get_payment_data(self):
+        """Retorna los datos del pago"""
+        method_id = self.payment_method.checkedId()
+        
+        if method_id == 0:  # BS
+            return {
+                'method': 'BS',
+                'ves_received': self.bs_received_input.value(),
+                'usd_received': 0,
+                'ves_change': max(0, self.bs_received_input.value() - self.total_ves),
+                'usd_change': 0
+            }
+        elif method_id == 1:  # USD
+            return {
+                'method': 'USD',
+                'ves_received': 0,
+                'usd_received': self.usd_received_input.value(),
+                'ves_change': float(self.usd_change_bs_label.text().replace(' Bs', '')),
+                'usd_change': self.usd_change_input.value()
+            }
+        elif method_id == 2:  # Mixto
+            return {
+                'method': 'Mixto',
+                'ves_received': self.mixed_bs_input.value(),
+                'usd_received': self.mixed_usd_input.value(),
+                'ves_change': float(self.mixed_change_bs_label.text().replace(' Bs', '')),
+                'usd_change': self.mixed_change_usd_input.value()
+            }
+
+class DiscountDialog(QDialog):
+    def __init__(self, parent=None, current_discount=0):
+        super().__init__(parent)
+        self.current_discount = current_discount
+        self.style_manager = StyleManager()
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Aplicar Descuento")
+        self.setFixedSize(300, 200)
+        self.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title = QLabel("Aplicar Descuento")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['subtitle'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Campo de descuento
+        form_layout = QFormLayout()
+        
+        self.discount_input = QDoubleSpinBox()
+        self.discount_input.setStyleSheet(self.style_manager.get_input_style())
+        self.discount_input.setRange(0, 100)
+        self.discount_input.setDecimals(2)
+        self.discount_input.setSuffix(" %")
+        self.discount_input.setValue(self.current_discount)
+        form_layout.addRow("Descuento:", self.discount_input)
+        
+        layout.addLayout(form_layout)
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        apply_btn = QPushButton("Aplicar")
+        apply_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+        apply_btn.clicked.connect(self.accept)
+        
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.setStyleSheet(self.style_manager.get_button_style())
+        cancel_btn.clicked.connect(self.reject)
+        
+        button_layout.addWidget(apply_btn)
+        button_layout.addWidget(cancel_btn)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+
+    def get_discount(self):
+        """Retorna el descuento aplicado"""
+        return self.discount_input.value()
+
+class SalesHistoryDialog(QDialog):
+    def __init__(self, parent=None, db_manager=None):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.style_manager = StyleManager()
+        self.init_ui()
+        self.load_sales()
+
+    def init_ui(self):
+        self.setWindowTitle("Historial de Ventas")
+        self.setFixedSize(1000, 600)
+        self.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title = QLabel("Historial de Ventas")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['title'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Tabla de ventas
+        self.sales_table = QTableWidget()
+        self.sales_table.setStyleSheet(self.style_manager.get_table_style())
+        self.sales_table.setColumnCount(7)
+        self.sales_table.setHorizontalHeaderLabels([
+            "ID", "Fecha/Hora", "Total USD", "Total BS", "Método", "Estado", "Acciones"
+        ])
+        
+        # Configurar tabla
+        header = self.sales_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        self.sales_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sales_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.sales_table)
+        
+        # Botón cerrar
+        close_btn = QPushButton("Cerrar")
+        close_btn.setStyleSheet(self.style_manager.get_button_style())
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+        
+        self.setLayout(layout)
+
+    def load_sales(self):
+        """Carga el historial de ventas"""
+        if not self.db_manager:
+            return
+        
+        sales = self.db_manager.get_all_sales()
+        self.sales_table.setRowCount(len(sales))
+        
+        for row, sale in enumerate(sales):
+            # ID
+            self.sales_table.setItem(row, 0, QTableWidgetItem(sale[0]))
+            
+            # Fecha/Hora
+            timestamp = datetime.fromisoformat(sale[1]).strftime("%d/%m/%Y %H:%M")
+            self.sales_table.setItem(row, 1, QTableWidgetItem(timestamp))
+            
+            # Total USD
+            self.sales_table.setItem(row, 2, QTableWidgetItem(f"${sale[2]:.2f}"))
+            
+            # Total BS
+            self.sales_table.setItem(row, 3, QTableWidgetItem(f"{sale[3]:.2f} Bs"))
+            
+            # Método
+            self.sales_table.setItem(row, 4, QTableWidgetItem(sale[5]))
+            
+            # Estado
+            status = "Cerrada" if len(sale) > 12 and sale[12] == 1 else "Abierta"
+            self.sales_table.setItem(row, 5, QTableWidgetItem(status))
+            
+            # Botón ver ticket
+            view_btn = QPushButton("Ver Ticket")
+            view_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+            view_btn.clicked.connect(lambda checked, sale_id=sale[0]: self.view_ticket(sale_id))
+            self.sales_table.setCellWidget(row, 6, view_btn)
+
+    def view_ticket(self, sale_id):
+        """Muestra el ticket de una venta"""
+        if not self.db_manager:
+            return
+        
+        # Obtener datos de la venta
+        conn = sqlite3.connect(self.db_manager.db_file)
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM sales WHERE id = ?', (sale_id,))
+        sale = cursor.fetchone()
+        
+        if not sale:
+            conn.close()
+            return
+        
+        # Obtener items de la venta
+        items = self.db_manager.get_sale_items(sale_id)
+        conn.close()
+        
+        # Crear diálogo del ticket
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Ticket - {sale_id}")
+        dialog.setFixedSize(400, 600)
+        dialog.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Contenido del ticket
+        ticket_text = QTextEdit()
+        ticket_text.setStyleSheet("""
+            QTextEdit {
+                background-color: white;
+                border: 2px solid #e2e8f0;
+                border-radius: 6px;
+                padding: 10px;
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+            }
+        """)
+        ticket_text.setReadOnly(True)
+        
+        # Generar contenido del ticket
+        ticket_content = self.generate_ticket_content(sale, items)
+        ticket_text.setPlainText(ticket_content)
+        
+        layout.addWidget(ticket_text)
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        print_btn = QPushButton("Imprimir")
+        print_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+        print_btn.clicked.connect(lambda: self.print_ticket(ticket_content))
+        
+        close_btn = QPushButton("Cerrar")
+        close_btn.setStyleSheet(self.style_manager.get_button_style())
+        close_btn.clicked.connect(dialog.close)
+        
+        button_layout.addWidget(print_btn)
+        button_layout.addWidget(close_btn)
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def generate_ticket_content(self, sale, items):
+        """Genera el contenido del ticket"""
+        content = []
+        content.append("=" * 40)
+        content.append("           TICKET DE VENTA")
+        content.append("=" * 40)
+        content.append("")
+        
+        # Información de la venta
+        timestamp = datetime.fromisoformat(sale[1])
+        content.append(f"Fecha: {timestamp.strftime('%d/%m/%Y')}")
+        content.append(f"Hora: {timestamp.strftime('%H:%M:%S')}")
+        content.append(f"Ticket: {sale[0]}")
+        content.append("")
+        content.append("-" * 40)
+        content.append("PRODUCTOS")
+        content.append("-" * 40)
+        
+        # Items
+        for item in items:
+            name = item[3][:25]  # Limitar nombre a 25 caracteres
+            qty = item[4]
+            price_usd = item[5]
+            price_ves = item[6]
+            subtotal_usd = item[9]
+            subtotal_ves = item[10]
+            
+            content.append(f"{name}")
+            content.append(f"  {qty} x ${price_usd:.2f} = ${subtotal_usd:.2f}")
+            content.append(f"  {qty} x {price_ves:.2f}Bs = {subtotal_ves:.2f}Bs")
+            content.append("")
+        
+        content.append("-" * 40)
+        content.append(f"TOTAL USD: ${sale[2]:.2f}")
+        content.append(f"TOTAL BS:  {sale[3]:.2f} Bs")
+        content.append("")
+        content.append(f"Método de pago: {sale[5]}")
+        content.append(f"Tasa de cambio: {sale[9]:.2f} Bs/$")
+        content.append("")
+        content.append("=" * 40)
+        content.append("        ¡GRACIAS POR SU COMPRA!")
+        content.append("=" * 40)
+        
+        return "\n".join(content)
+
+    def print_ticket(self, content):
+        """Imprime el ticket"""
+        try:
+            # Crear archivo temporal
+            temp_file = f"ticket_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            QMessageBox.information(self, "Ticket Guardado", 
+                                  f"Ticket guardado como: {temp_file}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error guardando ticket: {e}")
+
+class InventoryReportDialog(QDialog):
+    def __init__(self, parent=None, db_manager=None, exchange_rate=36.50):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.exchange_rate = exchange_rate
+        self.style_manager = StyleManager()
+        self.init_ui()
+        self.load_inventory()
+
+    def init_ui(self):
+        self.setWindowTitle("Reporte de Inventario")
+        self.setFixedSize(1200, 700)
+        self.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title = QLabel("Reporte de Inventario")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['title'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Información general
+        info_layout = QHBoxLayout()
+        
+        self.total_products_label = QLabel("Total Productos: 0")
+        self.total_products_label.setStyleSheet(self.style_manager.get_label_style("subtitle"))
+        
+        self.total_value_label = QLabel("Valor Total: $0.00 / 0.00 Bs")
+        self.total_value_label.setStyleSheet(self.style_manager.get_label_style("subtitle"))
+        
+        info_layout.addWidget(self.total_products_label)
+        info_layout.addWidget(self.total_value_label)
+        layout.addLayout(info_layout)
+        
+        # Tabla de inventario
+        self.inventory_table = QTableWidget()
+        self.inventory_table.setStyleSheet(self.style_manager.get_table_style())
+        self.inventory_table.setColumnCount(8)
+        self.inventory_table.setHorizontalHeaderLabels([
+            "ID", "Producto", "Stock", "Costo USD", "Costo BS", 
+            "Precio USD", "Precio BS", "Valor Total"
+        ])
+        
+        # Configurar tabla
+        header = self.inventory_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        self.inventory_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.inventory_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.inventory_table)
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        export_btn = QPushButton("Exportar PDF")
+        export_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+        export_btn.clicked.connect(self.export_pdf)
+        
+        close_btn = QPushButton("Cerrar")
+        close_btn.setStyleSheet(self.style_manager.get_button_style())
+        close_btn.clicked.connect(self.close)
+        
+        button_layout.addWidget(export_btn)
+        button_layout.addWidget(close_btn)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+
+    def load_inventory(self):
+        """Carga el inventario"""
+        if not self.db_manager:
+            return
+        
+        products = self.db_manager.get_all_products()
+        self.inventory_table.setRowCount(len(products))
+        
+        total_value_usd = 0
+        total_products = len(products)
+        
+        for row, product in enumerate(products):
+            product_id = product[0]
+            name = product[1]
+            price_ves = product[2]
+            price_usd = product[3]
+            stock = product[4]
+            cost_ves = product[6] if len(product) > 6 else 0
+            cost_usd = product[7] if len(product) > 7 else 0
+            
+            # Calcular valor total del producto
+            total_value_product = stock * price_usd
+            total_value_usd += total_value_product
+            
+            # Llenar tabla
+            self.inventory_table.setItem(row, 0, QTableWidgetItem(str(product_id)))
+            self.inventory_table.setItem(row, 1, QTableWidgetItem(name))
+            self.inventory_table.setItem(row, 2, QTableWidgetItem(f"{stock:.2f}"))
+            self.inventory_table.setItem(row, 3, QTableWidgetItem(f"${cost_usd:.2f}"))
+            self.inventory_table.setItem(row, 4, QTableWidgetItem(f"{cost_ves:.2f} Bs"))
+            self.inventory_table.setItem(row, 5, QTableWidgetItem(f"${price_usd:.2f}"))
+            self.inventory_table.setItem(row, 6, QTableWidgetItem(f"{price_ves:.2f} Bs"))
+            self.inventory_table.setItem(row, 7, QTableWidgetItem(f"${total_value_product:.2f}"))
+        
+        # Actualizar etiquetas
+        total_value_ves = total_value_usd * self.exchange_rate
+        self.total_products_label.setText(f"Total Productos: {total_products}")
+        self.total_value_label.setText(f"Valor Total: ${total_value_usd:.2f} / {total_value_ves:.2f} Bs")
+
+    def export_pdf(self):
+        """Exporta el reporte a PDF"""
+        try:
+            filename = f"inventario_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            
+            doc = SimpleDocTemplate(filename, pagesize=A4)
+            elements = []
+            styles = getSampleStyleSheet()
+            
+            # Título
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=18,
+                spaceAfter=30,
+                alignment=TA_CENTER
+            )
+            
+            title = Paragraph("REPORTE DE INVENTARIO", title_style)
+            elements.append(title)
+            
+            # Fecha
+            date_p = Paragraph(f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles['Normal'])
+            elements.append(date_p)
+            elements.append(Spacer(1, 20))
+            
+            # Tabla de productos
+            if not self.db_manager:
+                return
+            
+            products = self.db_manager.get_all_products()
+            
+            # Datos de la tabla
+            data = [['ID', 'Producto', 'Stock', 'Costo USD', 'Precio USD', 'Valor Total']]
+            
+            total_value = 0
+            for product in products:
+                product_id = product[0]
+                name = product[1][:30]  # Limitar nombre
+                price_usd = product[3]
+                stock = product[4]
+                cost_usd = product[7] if len(product) > 7 else 0
+                value = stock * price_usd
+                total_value += value
+                
+                data.append([
+                    str(product_id),
+                    name,
+                    f"{stock:.2f}",
+                    f"${cost_usd:.2f}",
+                    f"${price_usd:.2f}",
+                    f"${value:.2f}"
+                ])
+            
+            # Crear tabla
+            table = Table(data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            elements.append(table)
+            elements.append(Spacer(1, 20))
+            
+            # Total
+            total_p = Paragraph(f"<b>Valor Total del Inventario: ${total_value:.2f}</b>", styles['Normal'])
+            elements.append(total_p)
+            
+            doc.build(elements)
+            
+            QMessageBox.information(self, "Reporte Exportado", 
+                                  f"Reporte guardado como: {filename}")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error exportando reporte: {e}")
+
+class DailyReportDialog(QDialog):
+    def __init__(self, parent=None, db_manager=None, exchange_rate=36.50):
+        super().__init__(parent)
+        self.db_manager = db_manager
+        self.exchange_rate = exchange_rate
+        self.style_manager = StyleManager()
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Cerrar Caja del Día")
+        self.setFixedSize(600, 500)
+        self.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title = QLabel("Cerrar Caja del Día")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['title'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Información del día
+        today = datetime.now().strftime('%d/%m/%Y')
+        date_label = QLabel(f"Fecha: {today}")
+        date_label.setStyleSheet(self.style_manager.get_label_style("subtitle"))
+        date_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(date_label)
+        
+        # Resumen de ventas
+        self.summary_text = QTextEdit()
+        self.summary_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #f7fafc;
+                border: 2px solid #e2e8f0;
+                border-radius: 6px;
+                padding: 15px;
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+            }
+        """)
+        self.summary_text.setReadOnly(True)
+        layout.addWidget(self.summary_text)
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        generate_btn = QPushButton("Generar Reporte")
+        generate_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+        generate_btn.clicked.connect(self.generate_report)
+        
+        close_btn = QPushButton("Cerrar")
+        close_btn.setStyleSheet(self.style_manager.get_button_style())
+        close_btn.clicked.connect(self.close)
+        
+        button_layout.addWidget(generate_btn)
+        button_layout.addWidget(close_btn)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+        
+        # Cargar resumen inicial
+        self.load_daily_summary()
+
+    def load_daily_summary(self):
+        """Carga el resumen del día"""
+        if not self.db_manager:
+            return
+        
+        sales = self.db_manager.get_daily_sales()
+        
+        total_sales = len(sales)
+        total_usd = sum(sale[2] for sale in sales)
+        total_ves = sum(sale[3] for sale in sales)
+        
+        # Calcular ganancias
+        total_cost = 0
+        total_profit = 0
+        
+        for sale in sales:
+            items = self.db_manager.get_sale_items(sale[0])
+            for item in items:
+                cost = item[7] * item[4]  # cost_price_usd * quantity
+                total_cost += cost
+        
+        total_profit = total_usd - total_cost
+        profit_margin = (total_profit / total_usd * 100) if total_usd > 0 else 0
+        
+        # Generar resumen
+        summary = []
+        summary.append("=" * 50)
+        summary.append("           RESUMEN DEL DÍA")
+        summary.append("=" * 50)
+        summary.append("")
+        summary.append(f"Fecha: {datetime.now().strftime('%d/%m/%Y')}")
+        summary.append(f"Hora de cierre: {datetime.now().strftime('%H:%M:%S')}")
+        summary.append("")
+        summary.append("-" * 50)
+        summary.append("VENTAS")
+        summary.append("-" * 50)
+        summary.append(f"Total de ventas: {total_sales}")
+        summary.append(f"Total en USD: ${total_usd:.2f}")
+        summary.append(f"Total en BS: {total_ves:.2f} Bs")
+        summary.append("")
+        summary.append("-" * 50)
+        summary.append("COSTOS Y GANANCIAS")
+        summary.append("-" * 50)
+        summary.append(f"Costo total: ${total_cost:.2f}")
+        summary.append(f"Ganancia bruta: ${total_profit:.2f}")
+        summary.append(f"Margen de ganancia: {profit_margin:.2f}%")
+        summary.append("")
+        summary.append("=" * 50)
+        
+        self.summary_text.setPlainText("\n".join(summary))
+
+    def generate_report(self):
+        """Genera el reporte PDF y cierra las ventas del día"""
+        try:
+            # Confirmar acción
+            reply = QMessageBox.question(
+                self, 
+                "Confirmar Cierre", 
+                "¿Está seguro de cerrar la caja del día?\n\nEsta acción generará un reporte PDF y marcará todas las ventas del día como cerradas.",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Generar PDF
+            filename = f"cierre_caja_{datetime.now().strftime('%Y%m%d')}.pdf"
+            
+            doc = SimpleDocTemplate(filename, pagesize=A4)
+            elements = []
+            styles = getSampleStyleSheet()
+            
+            # Título
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=20,
+                spaceAfter=30,
+                alignment=TA_CENTER
+            )
+            
+            title = Paragraph("CIERRE DE CAJA DIARIO", title_style)
+            elements.append(title)
+            
+            # Fecha y hora
+            date_p = Paragraph(f"Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}", styles['Normal'])
+            elements.append(date_p)
+            elements.append(Spacer(1, 20))
+            
+            # Obtener datos
+            sales = self.db_manager.get_daily_sales()
+            
+            # Resumen general
+            total_sales = len(sales)
+            total_usd = sum(sale[2] for sale in sales)
+            total_ves = sum(sale[3] for sale in sales)
+            
+            summary_data = [
+                ['Concepto', 'Valor'],
+                ['Total de ventas', str(total_sales)],
+                ['Total USD', f'${total_usd:.2f}'],
+                ['Total BS', f'{total_ves:.2f} Bs'],
+                ['Tasa de cambio', f'{self.exchange_rate:.2f} Bs/$']
+            ]
+            
+            summary_table = Table(summary_data)
+            summary_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            elements.append(summary_table)
+            elements.append(Spacer(1, 30))
+            
+            # Detalle de ganancias por producto
+            elements.append(Paragraph("DETALLE DE GANANCIAS POR PRODUCTO", styles['Heading2']))
+            elements.append(Spacer(1, 10))
+            
+            profit_data = [['Producto', 'Cantidad', 'Costo Unit.', 'Precio Unit.', 'Ganancia Unit.', 'Ganancia Total']]
+            
+            total_cost = 0
+            total_profit = 0
+            
+            # Agrupar productos vendidos
+            product_sales = {}
+            
+            for sale in sales:
+                items = self.db_manager.get_sale_items(sale[0])
+                for item in items:
+                    product_name = item[3]
+                    if product_name not in product_sales:
+                        product_sales[product_name] = {
+                            'quantity': 0,
+                            'cost_usd': item[7],
+                            'price_usd': item[5],
+                            'total_cost': 0,
+                            'total_revenue': 0
+                        }
+                    
+                    product_sales[product_name]['quantity'] += item[4]
+                    product_sales[product_name]['total_cost'] += item[7] * item[4]
+                    product_sales[product_name]['total_revenue'] += item[9]
+            
+            for product_name, data in product_sales.items():
+                cost_unit = data['cost_usd']
+                price_unit = data['price_usd']
+                profit_unit = price_unit - cost_unit
+                profit_total = data['total_revenue'] - data['total_cost']
+                
+                total_cost += data['total_cost']
+                total_profit += profit_total
+                
+                profit_data.append([
+                    product_name[:20],
+                    f"{data['quantity']:.2f}",
+                    f"${cost_unit:.2f}",
+                    f"${price_unit:.2f}",
+                    f"${profit_unit:.2f}",
+                    f"${profit_total:.2f}"
+                ])
+            
+            profit_table = Table(profit_data)
+            profit_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            elements.append(profit_table)
+            elements.append(Spacer(1, 20))
+            
+            # Resumen final
+            profit_margin = (total_profit / total_usd * 100) if total_usd > 0 else 0
+            
+            final_summary = [
+                ['RESUMEN FINAL', ''],
+                ['Costo Total', f'${total_cost:.2f}'],
+                ['Ingresos Totales', f'${total_usd:.2f}'],
+                ['Ganancia Bruta', f'${total_profit:.2f}'],
+                ['Margen de Ganancia', f'{profit_margin:.2f}%']
+            ]
+            
+            final_table = Table(final_summary)
+            final_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.darkgreen),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.lightgreen),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ]))
+            
+            elements.append(final_table)
+            
+            doc.build(elements)
+            
+            # Cerrar ventas del día
+            self.db_manager.close_daily_sales()
+            
+            QMessageBox.information(
+                self, 
+                "Caja Cerrada", 
+                f"Caja cerrada exitosamente.\nReporte guardado como: {filename}"
+            )
+            
+            self.close()
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error generando reporte: {e}")
+
+class EditableTableWidget(QTableWidget):
+    """Tabla personalizada que permite editar cantidad con doble click"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.itemDoubleClicked.connect(self.on_item_double_clicked)
+        
+    def on_item_double_clicked(self, item):
+        """Maneja el doble click en items de la tabla"""
+        if item.column() == 1:  # Columna de cantidad
+            self.edit_quantity(item.row())
+    
+    def edit_quantity(self, row):
+        """Permite editar la cantidad de un producto"""
+        current_qty = float(self.item(row, 1).text())
+        
+        qty, ok = QInputDialog.getDouble(
+            self, 
+            "Editar Cantidad", 
+            "Nueva cantidad:", 
+            current_qty, 
+            0.01, 
+            999999.99, 
+            2
+        )
+        
+        if ok and qty != current_qty:
+            self.item(row, 1).setText(str(qty))
+            # Emitir señal personalizada para actualizar totales
+            if hasattr(self.parent(), 'update_cart_totals'):
+                self.parent().update_cart_totals()
+
+class POSMainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.db_manager = DatabaseManager()
+        self.exchange_manager = ExchangeRateManager()
+        self.style_manager = StyleManager()
+        self.cart_items = []
+        self.shortcuts = self.db_manager.get_shortcuts()
+        
+        self.init_ui()
+        self.setup_shortcuts()
+        self.update_exchange_rate_display()
+        
+        # Timer para actualizar tasa de cambio en la UI
+        self.rate_timer = QTimer()
+        self.rate_timer.timeout.connect(self.update_exchange_rate_display)
+        self.rate_timer.start(60000)  # Actualizar cada minuto
+
+    def init_ui(self):
+        self.setWindowTitle("Sistema POS - Punto de Venta")
+        self.setGeometry(100, 100, 1400, 800)
+        
+        # Aplicar estilos
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background-color: {self.style_manager.colors['background']};
+            }}
+            {self.style_manager.get_menu_style()}
+            {self.style_manager.get_scrollbar_style()}
+        """)
+        
+        # Widget central
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Layout principal
+        main_layout = QHBoxLayout(central_widget)
+        
+        # Panel izquierdo - Productos
+        left_panel = self.create_products_panel()
+        main_layout.addWidget(left_panel, 2)
+        
+        # Panel derecho - Carrito y totales
+        right_panel = self.create_cart_panel()
+        main_layout.addWidget(right_panel, 1)
+        
+        # Crear menú
+        self.create_menu()
+        
+        # Barra de estado
+        self.create_status_bar()
+
+    def create_products_panel(self):
+        """Crea el panel de productos"""
+        panel = QFrame()
+        panel.setStyleSheet(self.style_manager.get_frame_style("main"))
+        layout = QVBoxLayout(panel)
+        
+        # Título
+        title = QLabel("PRODUCTOS")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['title'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Barra de búsqueda
+        search_layout = QHBoxLayout()
+        
+        self.search_input = QLineEdit()
+        self.search_input.setStyleSheet(self.style_manager.get_input_style())
+        self.search_input.setPlaceholderText("Buscar productos por nombre o ID...")
+        self.search_input.textChanged.connect(self.search_products)
+        
+        search_btn = QPushButton("🔍")
+        search_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+        search_btn.setFixedSize(40, 35)
+        search_btn.clicked.connect(self.search_products)
+        
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(search_btn)
+        layout.addLayout(search_layout)
+        
+        # Tabla de productos
+        self.products_table = QTableWidget()
+        self.products_table.setStyleSheet(self.style_manager.get_table_style())
+        self.products_table.setColumnCount(6)
+        self.products_table.setHorizontalHeaderLabels([
+            "ID", "Producto", "Stock", "Precio USD", "Precio BS", "Acciones"
+        ])
+        
+        # Configurar tabla
+        header = self.products_table.horizontalHeader()
+        header.setStretchLastSection(True)
+        self.products_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.products_table.setAlternatingRowColors(True)
+        self.products_table.doubleClicked.connect(self.add_product_to_cart)
+        
+        layout.addWidget(self.products_table)
+        
+        # Botones de gestión
+        buttons_layout = QHBoxLayout()
+        
+        add_product_btn = QPushButton("Agregar Producto")
+        add_product_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+        add_product_btn.clicked.connect(self.add_new_product)
+        
+        add_stock_btn = QPushButton("Agregar Stock")
+        add_stock_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+        add_stock_btn.clicked.connect(self.add_stock_to_product)
+        
+        buttons_layout.addWidget(add_product_btn)
+        buttons_layout.addWidget(add_stock_btn)
+        layout.addLayout(buttons_layout)
+        
+        # Cargar productos
+        self.load_products()
+        
+        return panel
+
+    def create_cart_panel(self):
+        """Crea el panel del carrito"""
+        panel = QFrame()
+        panel.setStyleSheet(self.style_manager.get_frame_style("main"))
+        layout = QVBoxLayout(panel)
+        
+        # Título
+        title = QLabel("CARRITO DE COMPRAS")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['title'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Información de tasa de cambio
+        self.exchange_rate_label = QLabel("Tasa: $1 = 36.50 Bs")
+        self.exchange_rate_label.setStyleSheet(self.style_manager.get_label_style("info"))
+        self.exchange_rate_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.exchange_rate_label)
+        
+        # Tabla del carrito
+        self.cart_table = EditableTableWidget(self)
+        self.cart_table.setStyleSheet(self.style_manager.get_table_style())
+        self.cart_table.setColumnCount(5)
+        self.cart_table.setHorizontalHeaderLabels([
+            "Producto", "Cantidad", "Precio USD", "Precio BS", "Subtotal USD"
+        ])
+        
+        # Configurar tabla del carrito
+        cart_header = self.cart_table.horizontalHeader()
+        cart_header.setStretchLastSection(True)
+        self.cart_table.setAlternatingRowColors(True)
+        
+        layout.addWidget(self.cart_table)
+        
+        # Panel de descuento
+        discount_layout = QHBoxLayout()
+        
+        discount_label = QLabel("Descuento:")
+        discount_label.setStyleSheet(self.style_manager.get_label_style())
+        
+        self.discount_input = QDoubleSpinBox()
+        self.discount_input.setStyleSheet(self.style_manager.get_input_style())
+        self.discount_input.setRange(0, 100)
+        self.discount_input.setDecimals(2)
+        self.discount_input.setSuffix(" %")
+        self.discount_input.valueChanged.connect(self.update_cart_totals)
+        
+        apply_discount_btn = QPushButton("Aplicar")
+        apply_discount_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+        apply_discount_btn.clicked.connect(self.apply_discount_dialog)
+        
+        discount_layout.addWidget(discount_label)
+        discount_layout.addWidget(self.discount_input)
+        discount_layout.addWidget(apply_discount_btn)
+        layout.addLayout(discount_layout)
+        
+        # Panel de totales
+        totals_frame = QFrame()
+        totals_frame.setStyleSheet(self.style_manager.get_frame_style("section"))
+        totals_layout = QVBoxLayout(totals_frame)
+        
+        self.subtotal_label = QLabel("Subtotal: $0.00 / 0.00 Bs")
+        self.subtotal_label.setStyleSheet(self.style_manager.get_label_style("subtitle"))
+        
+        self.discount_label = QLabel("Descuento: $0.00 / 0.00 Bs")
+        self.discount_label.setStyleSheet(self.style_manager.get_label_style())
+        
+        self.total_label = QLabel("TOTAL: $0.00 / 0.00 Bs")
+        self.total_label.setStyleSheet(self.style_manager.get_label_style("total"))
+        self.total_label.setFont(self.style_manager.fonts['subtitle'])
+        
+        totals_layout.addWidget(self.subtotal_label)
+        totals_layout.addWidget(self.discount_label)
+        totals_layout.addWidget(self.total_label)
+        layout.addWidget(totals_frame)
+        
+        # Botones de acción
+        actions_layout = QVBoxLayout()
+        
+        process_sale_btn = QPushButton("PROCESAR VENTA")
+        process_sale_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+        process_sale_btn.setFont(self.style_manager.fonts['subtitle'])
+        process_sale_btn.clicked.connect(self.process_sale)
+        
+        clear_cart_btn = QPushButton("Limpiar Carrito")
+        clear_cart_btn.setStyleSheet(self.style_manager.get_button_style("danger"))
+        clear_cart_btn.clicked.connect(self.clear_cart)
+        
+        remove_item_btn = QPushButton("Quitar Seleccionado")
+        remove_item_btn.setStyleSheet(self.style_manager.get_button_style("warning"))
+        remove_item_btn.clicked.connect(self.remove_selected_item)
+        
+        actions_layout.addWidget(process_sale_btn)
+        actions_layout.addWidget(clear_cart_btn)
+        actions_layout.addWidget(remove_item_btn)
+        layout.addLayout(actions_layout)
+        
+        return panel
+
+    def create_menu(self):
+        """Crea el menú principal"""
+        menubar = self.menuBar()
+        
+        # Menú Archivo
+        file_menu = menubar.addMenu('Archivo')
+        
+        backup_action = QAction('Crear Backup', self)
+        backup_action.triggered.connect(self.create_backup)
+        file_menu.addAction(backup_action)
+        
+        file_menu.addSeparator()
+        
+        exit_action = QAction('Salir', self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # Menú Productos
+        products_menu = menubar.addMenu('Productos')
+        
+        add_product_action = QAction('Agregar Producto', self)
+        add_product_action.triggered.connect(self.add_new_product)
+        products_menu.addAction(add_product_action)
+        
+        inventory_report_action = QAction('Reporte de Inventario', self)
+        inventory_report_action.triggered.connect(self.show_inventory_report)
+        products_menu.addAction(inventory_report_action)
+        
+        # Menú Ventas
+        sales_menu = menubar.addMenu('Ventas')
+        
+        sales_history_action = QAction('Historial de Ventas', self)
+        sales_history_action.triggered.connect(self.show_sales_history)
+        sales_menu.addAction(sales_history_action)
+        
+        daily_report_action = QAction('Cerrar Caja del Día', self)
+        daily_report_action.triggered.connect(self.show_daily_report)
+        sales_menu.addAction(daily_report_action)
+        
+        # Menú Configuración
+        config_menu = menubar.addMenu('Configuración')
+        
+        exchange_rate_action = QAction('Configurar Tasa de Cambio', self)
+        exchange_rate_action.triggered.connect(self.configure_exchange_rate)
+        config_menu.addAction(exchange_rate_action)
+        
+        shortcuts_action = QAction('Atajos de Teclado', self)
+        shortcuts_action.triggered.connect(self.configure_shortcuts)
+        config_menu.addAction(shortcuts_action)
+        
+        # Menú Ayuda
+        help_menu = menubar.addMenu('Ayuda')
+        
+        about_action = QAction('Acerca de', self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+
+    def create_status_bar(self):
+        """Crea la barra de estado"""
+        self.status_bar = self.statusBar()
+        
+        # Información de la aplicación
+        self.status_label = QLabel("Sistema POS - Listo")
+        self.status_bar.addWidget(self.status_label)
+        
+        # Información de la base de datos
+        self.db_status_label = QLabel("BD: Conectada")
+        self.status_bar.addPermanentWidget(self.db_status_label)
+        
+        # Fecha y hora
+        self.datetime_label = QLabel()
+        self.update_datetime()
+        self.status_bar.addPermanentWidget(self.datetime_label)
+        
+        # Timer para actualizar fecha/hora
+        self.datetime_timer = QTimer()
+        self.datetime_timer.timeout.connect(self.update_datetime)
+        self.datetime_timer.start(1000)
+
+    def setup_shortcuts(self):
+        """Configura los atajos de teclado"""
+        for action, shortcut in self.shortcuts.items():
+            if action == "new_sale":
+                QShortcut(QKeySequence(shortcut), self, self.clear_cart)
+            elif action == "process_sale":
+                QShortcut(QKeySequence(shortcut), self, self.process_sale)
+            elif action == "add_product":
+                QShortcut(QKeySequence(shortcut), self, self.add_new_product)
+            elif action == "search":
+                QShortcut(QKeySequence(shortcut), self, lambda: self.search_input.setFocus())
+            elif action == "daily_report":
+                QShortcut(QKeySequence(shortcut), self, self.show_daily_report)
+
+    def update_datetime(self):
+        """Actualiza la fecha y hora en la barra de estado"""
+        current_time = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        self.datetime_label.setText(current_time)
+
+    def update_exchange_rate_display(self):
+        """Actualiza la visualización de la tasa de cambio"""
+        rate = self.exchange_manager.get_rate()
+        self.exchange_rate_label.setText(f"Tasa: $1 = {rate:.2f} Bs")
+
+    def load_products(self):
+        """Carga los productos en la tabla"""
+        products = self.db_manager.get_all_products()
+        self.products_table.setRowCount(len(products))
+        
+        for row, product in enumerate(products):
+            # ID
+            self.products_table.setItem(row, 0, QTableWidgetItem(str(product[0])))
+            
+            # Nombre
+            self.products_table.setItem(row, 1, QTableWidgetItem(product[1]))
+            
+            # Stock
+            stock_item = QTableWidgetItem(f"{product[4]:.2f}")
+            if product[4] <= 5:  # Stock bajo
+                stock_item.setBackground(QColor("#fed7d7"))
+            self.products_table.setItem(row, 2, stock_item)
+            
+            # Precio USD
+            self.products_table.setItem(row, 3, QTableWidgetItem(f"${product[3]:.2f}"))
+            
+            # Precio BS
+            self.products_table.setItem(row, 4, QTableWidgetItem(f"{product[2]:.2f} Bs"))
+            
+            # Botones de acción
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(5, 2, 5, 2)
+            
+            add_btn = QPushButton("➕")
+            add_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+            add_btn.setFixedSize(30, 25)
+            add_btn.clicked.connect(lambda checked, p=product: self.add_product_to_cart_by_data(p))
+            
+            edit_btn = QPushButton("✏️")
+            edit_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+            edit_btn.setFixedSize(30, 25)
+            edit_btn.clicked.connect(lambda checked, p=product: self.edit_product(p))
+            actions_layout.addWidget(add_btn)
+            actions_layout.addWidget(edit_btn)
+            actions_layout.setSpacing(2)
+            
+            self.products_table.setCellWidget(row, 5, actions_widget)
+
+    def search_products(self):
+        """Busca productos por nombre o ID"""
+        search_text = self.search_input.text().strip()
+        
+        if not search_text:
+            self.load_products()
+            return
+        
+        products = self.db_manager.search_products(search_text)
+        self.products_table.setRowCount(len(products))
+        
+        for row, product in enumerate(products):
+            # ID
+            self.products_table.setItem(row, 0, QTableWidgetItem(str(product[0])))
+            
+            # Nombre
+            self.products_table.setItem(row, 1, QTableWidgetItem(product[1]))
+            
+            # Stock
+            stock_item = QTableWidgetItem(f"{product[4]:.2f}")
+            if product[4] <= 5:  # Stock bajo
+                stock_item.setBackground(QColor("#fed7d7"))
+            self.products_table.setItem(row, 2, stock_item)
+            
+            # Precio USD
+            self.products_table.setItem(row, 3, QTableWidgetItem(f"${product[3]:.2f}"))
+            
+            # Precio BS
+            self.products_table.setItem(row, 4, QTableWidgetItem(f"{product[2]:.2f} Bs"))
+            
+            # Botones de acción
+            actions_widget = QWidget()
+            actions_layout = QHBoxLayout(actions_widget)
+            actions_layout.setContentsMargins(5, 2, 5, 2)
+            
+            add_btn = QPushButton("➕")
+            add_btn.setStyleSheet(self.style_manager.get_button_style("success"))
+            add_btn.setFixedSize(30, 25)
+            add_btn.clicked.connect(lambda checked, p=product: self.add_product_to_cart_by_data(p))
+            
+            edit_btn = QPushButton("✏️")
+            edit_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+            edit_btn.setFixedSize(30, 25)
+            edit_btn.clicked.connect(lambda checked, p=product: self.edit_product(p))
+            
+            actions_layout.addWidget(add_btn)
+            actions_layout.addWidget(edit_btn)
+            actions_layout.setSpacing(2)
+            
+            self.products_table.setCellWidget(row, 5, actions_widget)
+
+    def add_product_to_cart(self):
+        """Agrega producto al carrito desde doble click en tabla"""
+        current_row = self.products_table.currentRow()
+        if current_row >= 0:
+            product_id = int(self.products_table.item(current_row, 0).text())
+            product = self.db_manager.get_product_by_id(product_id)
+            if product:
+                self.add_product_to_cart_by_data(product)
+
+    def add_product_to_cart_by_data(self, product):
+        """Agrega producto al carrito usando datos del producto"""
+        if product[4] <= 0:  # Sin stock
+            QMessageBox.warning(self, "Sin Stock", "Este producto no tiene stock disponible")
+            return
+        
+        # Verificar si el producto ya está en el carrito
+        for i, item in enumerate(self.cart_items):
+            if item['id'] == product[0]:
+                # Incrementar cantidad
+                new_qty = item['quantity'] + 1
+                if new_qty <= product[4]:  # Verificar stock disponible
+                    item['quantity'] = new_qty
+                    self.update_cart_display()
+                    self.update_cart_totals()
+                else:
+                    QMessageBox.warning(self, "Stock Insuficiente", 
+                                      f"Solo hay {product[4]:.2f} unidades disponibles")
+                return
+        
+        # Agregar nuevo producto al carrito
+        cart_item = {
+            'id': product[0],
+            'name': product[1],
+            'price_ves': product[2],
+            'price_usd': product[3],
+            'quantity': 1,
+            'max_stock': product[4],
+            'cost_price_ves': product[6] if len(product) > 6 else 0,
+            'cost_price_usd': product[7] if len(product) > 7 else 0
+        }
+        
+        self.cart_items.append(cart_item)
+        self.update_cart_display()
+        self.update_cart_totals()
+
+    def update_cart_display(self):
+        """Actualiza la visualización del carrito"""
+        self.cart_table.setRowCount(len(self.cart_items))
+        
+        for row, item in enumerate(self.cart_items):
+            # Producto
+            self.cart_table.setItem(row, 0, QTableWidgetItem(item['name']))
+            
+            # Cantidad (editable)
+            qty_item = QTableWidgetItem(str(item['quantity']))
+            self.cart_table.setItem(row, 1, qty_item)
+            
+            # Precio USD
+            self.cart_table.setItem(row, 2, QTableWidgetItem(f"${item['price_usd']:.2f}"))
+            
+            # Precio BS
+            self.cart_table.setItem(row, 3, QTableWidgetItem(f"{item['price_ves']:.2f} Bs"))
+            
+            # Subtotal USD
+            subtotal = item['quantity'] * item['price_usd']
+            self.cart_table.setItem(row, 4, QTableWidgetItem(f"${subtotal:.2f}"))
+
+    def update_cart_totals(self):
+        """Actualiza los totales del carrito"""
+        # Actualizar cantidades desde la tabla
+        for row in range(self.cart_table.rowCount()):
+            try:
+                new_qty = float(self.cart_table.item(row, 1).text())
+                if new_qty > 0 and new_qty <= self.cart_items[row]['max_stock']:
+                    self.cart_items[row]['quantity'] = new_qty
+                elif new_qty > self.cart_items[row]['max_stock']:
+                    # Restaurar cantidad máxima
+                    self.cart_items[row]['quantity'] = self.cart_items[row]['max_stock']
+                    self.cart_table.item(row, 1).setText(str(self.cart_items[row]['max_stock']))
+                    QMessageBox.warning(self, "Stock Insuficiente", 
+                                      f"Solo hay {self.cart_items[row]['max_stock']:.2f} unidades disponibles")
+            except (ValueError, AttributeError):
+                # Restaurar cantidad anterior si hay error
+                self.cart_table.item(row, 1).setText(str(self.cart_items[row]['quantity']))
+        
+        # Calcular totales
+        subtotal_usd = sum(item['quantity'] * item['price_usd'] for item in self.cart_items)
+        subtotal_ves = sum(item['quantity'] * item['price_ves'] for item in self.cart_items)
+        
+        # Aplicar descuento
+        discount_percent = self.discount_input.value()
+        discount_usd = subtotal_usd * (discount_percent / 100)
+        discount_ves = subtotal_ves * (discount_percent / 100)
+        
+        total_usd = subtotal_usd - discount_usd
+        total_ves = subtotal_ves - discount_ves
+        
+        # Actualizar etiquetas
+        self.subtotal_label.setText(f"Subtotal: ${subtotal_usd:.2f} / {subtotal_ves:.2f} Bs")
+        self.discount_label.setText(f"Descuento ({discount_percent:.1f}%): ${discount_usd:.2f} / {discount_ves:.2f} Bs")
+        self.total_label.setText(f"TOTAL: ${total_usd:.2f} / {total_ves:.2f} Bs")
+        
+        # Actualizar subtotales en la tabla
+        self.update_cart_display()
+
+    def apply_discount_dialog(self):
+        """Muestra diálogo para aplicar descuento"""
+        dialog = DiscountDialog(self, self.discount_input.value())
+        if dialog.exec_() == QDialog.Accepted:
+            discount = dialog.get_discount()
+            self.discount_input.setValue(discount)
+            self.update_cart_totals()
+
+    def remove_selected_item(self):
+        """Quita el item seleccionado del carrito"""
+        current_row = self.cart_table.currentRow()
+        if current_row >= 0:
+            reply = QMessageBox.question(
+                self, 
+                "Confirmar", 
+                "¿Desea quitar este producto del carrito?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                del self.cart_items[current_row]
+                self.update_cart_display()
+                self.update_cart_totals()
+
+    def clear_cart(self):
+        """Limpia el carrito"""
+        if self.cart_items:
+            reply = QMessageBox.question(
+                self, 
+                "Confirmar", 
+                "¿Desea limpiar todo el carrito?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.cart_items.clear()
+                self.discount_input.setValue(0)
+                self.update_cart_display()
+                self.update_cart_totals()
+
+    def process_sale(self):
+        """Procesa la venta"""
+        if not self.cart_items:
+            QMessageBox.warning(self, "Carrito Vacío", "Agregue productos al carrito antes de procesar la venta")
+            return
+        
+        # Verificar stock disponible
+        for item in self.cart_items:
+            current_product = self.db_manager.get_product_by_id(item['id'])
+            if not current_product or current_product[4] < item['quantity']:
+                QMessageBox.warning(
+                    self, 
+                    "Stock Insuficiente", 
+                    f"No hay suficiente stock para {item['name']}\n"
+                    f"Stock disponible: {current_product[4] if current_product else 0}\n"
+                    f"Cantidad solicitada: {item['quantity']}"
+                )
+                return
+        
+        # Calcular totales
+        subtotal_usd = sum(item['quantity'] * item['price_usd'] for item in self.cart_items)
+        subtotal_ves = sum(item['quantity'] * item['price_ves'] for item in self.cart_items)
+        
+        discount_percent = self.discount_input.value()
+        discount_usd = subtotal_usd * (discount_percent / 100)
+        discount_ves = subtotal_ves * (discount_percent / 100)
+        
+        total_usd = subtotal_usd - discount_usd
+        total_ves = subtotal_ves - discount_ves
+        
+        # Mostrar diálogo de pago
+        payment_dialog = PaymentDialog(
+            self, 
+            total_usd, 
+            total_ves, 
+            self.exchange_manager.get_rate()
+        )
+        
+        if payment_dialog.exec_() == QDialog.Accepted:
+            payment_data = payment_dialog.get_payment_data()
+            
+            try:
+                # Crear venta en la base de datos
+                sale_id = self.db_manager.create_sale(
+                    total_usd=total_usd,
+                    total_ves=total_ves,
+                    discount_percent=discount_percent,
+                    payment_method=payment_data['method'],
+                    ves_received=payment_data['ves_received'],
+                    usd_received=payment_data['usd_received'],
+                    ves_change=payment_data['ves_change'],
+                    usd_change=payment_data['usd_change'],
+                    exchange_rate=self.exchange_manager.get_rate()
+                )
+                
+                # Agregar items de la venta
+                for item in self.cart_items:
+                    self.db_manager.add_sale_item(
+                        sale_id=sale_id,
+                        product_id=item['id'],
+                        quantity=item['quantity'],
+                        price_usd=item['price_usd'],
+                        price_ves=item['price_ves'],
+                        cost_price_usd=item['cost_price_usd'],
+                        cost_price_ves=item['cost_price_ves']
+                    )
+                    
+                    # Actualizar stock
+                    self.db_manager.update_product_stock(
+                        item['id'], 
+                        -item['quantity']  # Restar del stock
+                    )
+                
+                # Mostrar ticket
+                self.show_sale_ticket(sale_id, payment_data)
+                
+                # Limpiar carrito
+                self.cart_items.clear()
+                self.discount_input.setValue(0)
+                self.update_cart_display()
+                self.update_cart_totals()
+                
+                # Recargar productos para actualizar stock
+                self.load_products()
+                
+                # Actualizar barra de estado
+                self.status_label.setText(f"Venta procesada exitosamente - Ticket: {sale_id}")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error procesando la venta: {e}")
+
+    def show_sale_ticket(self, sale_id, payment_data):
+        """Muestra el ticket de la venta"""
+        # Obtener datos de la venta
+        sale = self.db_manager.get_sale_by_id(sale_id)
+        if not sale:
+            return
+        
+        # Crear diálogo del ticket
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Ticket de Venta - {sale_id}")
+        dialog.setFixedSize(400, 600)
+        dialog.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Contenido del ticket
+        ticket_text = QTextEdit()
+        ticket_text.setStyleSheet("""
+            QTextEdit {
+                background-color: white;
+                border: 2px solid #e2e8f0;
+                border-radius: 6px;
+                padding: 10px;
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+            }
+        """)
+        ticket_text.setReadOnly(True)
+        
+        # Generar contenido del ticket
+        ticket_content = self.generate_current_ticket_content(sale, payment_data)
+        ticket_text.setPlainText(ticket_content)
+        
+        layout.addWidget(ticket_text)
+        
+        # Botones
+        button_layout = QHBoxLayout()
+        
+        print_btn = QPushButton("Imprimir")
+        print_btn.setStyleSheet(self.style_manager.get_button_style("primary"))
+        print_btn.clicked.connect(lambda: self.print_current_ticket(ticket_content))
+        
+        close_btn = QPushButton("Cerrar")
+        close_btn.setStyleSheet(self.style_manager.get_button_style())
+        close_btn.clicked.connect(dialog.close)
+        
+        button_layout.addWidget(print_btn)
+        button_layout.addWidget(close_btn)
+        layout.addLayout(button_layout)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def generate_current_ticket_content(self, sale, payment_data):
+        """Genera el contenido del ticket actual"""
+        content = []
+        content.append("=" * 40)
+        content.append("           TICKET DE VENTA")
+        content.append("=" * 40)
+        content.append("")
+        
+        # Información de la venta
+        timestamp = datetime.fromisoformat(sale[1])
+        content.append(f"Fecha: {timestamp.strftime('%d/%m/%Y')}")
+        content.append(f"Hora: {timestamp.strftime('%H:%M:%S')}")
+        content.append(f"Ticket: {sale[0]}")
+        content.append("")
+        content.append("-" * 40)
+        content.append("PRODUCTOS")
+        content.append("-" * 40)
+        
+        # Items del carrito actual
+        for item in self.cart_items:
+            name = item['name'][:25]  # Limitar nombre a 25 caracteres
+            qty = item['quantity']
+            price_usd = item['price_usd']
+            price_ves = item['price_ves']
+            subtotal_usd = qty * price_usd
+            subtotal_ves = qty * price_ves
+            
+            content.append(f"{name}")
+            content.append(f"  {qty} x ${price_usd:.2f} = ${subtotal_usd:.2f}")
+            content.append(f"  {qty} x {price_ves:.2f}Bs = {subtotal_ves:.2f}Bs")
+            content.append("")
+        
+        content.append("-" * 40)
+        content.append(f"SUBTOTAL: ${sale[2] + (sale[2] * sale[4] / 100):.2f} / {sale[3] + (sale[3] * sale[4] / 100):.2f} Bs")
+        
+        if sale[4] > 0:  # Si hay descuento
+            content.append(f"DESCUENTO ({sale[4]:.1f}%): ${(sale[2] + (sale[2] * sale[4] / 100)) - sale[2]:.2f} / {(sale[3] + (sale[3] * sale[4] / 100)) - sale[3]:.2f} Bs")
+        
+        content.append(f"TOTAL: ${sale[2]:.2f} / {sale[3]:.2f} Bs")
+        content.append("")
+        content.append("-" * 40)
+        content.append("PAGO")
+        content.append("-" * 40)
+        content.append(f"Método: {payment_data['method']}")
+        
+        if payment_data['ves_received'] > 0:
+            content.append(f"Recibido BS: {payment_data['ves_received']:.2f} Bs")
+        if payment_data['usd_received'] > 0:
+            content.append(f"Recibido USD: ${payment_data['usd_received']:.2f}")
+        if payment_data['ves_change'] > 0:
+            content.append(f"Cambio BS: {payment_data['ves_change']:.2f} Bs")
+        if payment_data['usd_change'] > 0:
+            content.append(f"Cambio USD: ${payment_data['usd_change']:.2f}")
+        
+        content.append("")
+        content.append(f"Tasa de cambio: {sale[9]:.2f} Bs/$")
+        content.append("")
+        content.append("=" * 40)
+        content.append("        ¡GRACIAS POR SU COMPRA!")
+        content.append("=" * 40)
+        
+        return "\n".join(content)
+
+    def print_current_ticket(self, content):
+        """Imprime el ticket actual"""
+        try:
+            # Crear archivo temporal
+            temp_file = f"ticket_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            QMessageBox.information(self, "Ticket Guardado", 
+                                  f"Ticket guardado como: {temp_file}")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error guardando ticket: {e}")
+
+    def add_new_product(self):
+        """Agrega un nuevo producto"""
+        dialog = ProductDialog(self, self.db_manager, self.exchange_manager.get_rate())
+        if dialog.exec_() == QDialog.Accepted:
+            self.load_products()
+            self.status_label.setText("Producto agregado exitosamente")
+
+    def edit_product(self, product):
+        """Edita un producto existente"""
+        dialog = ProductDialog(self, self.db_manager, self.exchange_manager.get_rate(), product)
+        if dialog.exec_() == QDialog.Accepted:
+            self.load_products()
+            self.status_label.setText("Producto actualizado exitosamente")
+
+    def add_stock_to_product(self):
+        """Agrega stock a un producto seleccionado"""
+        current_row = self.products_table.currentRow()
+        if current_row < 0:
+            QMessageBox.information(self, "Seleccionar Producto", "Seleccione un producto de la tabla")
+            return
+        
+        product_id = int(self.products_table.item(current_row, 0).text())
+        product = self.db_manager.get_product_by_id(product_id)
+        
+        if not product:
+            QMessageBox.warning(self, "Error", "Producto no encontrado")
+            return
+        
+        # Solicitar cantidad a agregar
+        quantity, ok = QInputDialog.getDouble(
+            self, 
+            "Agregar Stock", 
+            f"Producto: {product[1]}\nStock actual: {product[4]:.2f}\n\nCantidad a agregar:", 
+            0.0, 
+            0.01, 
+            999999.99, 
+            2
+        )
+        
+        if ok and quantity > 0:
+            try:
+                self.db_manager.update_product_stock(product_id, quantity)
+                self.load_products()
+                self.status_label.setText(f"Stock agregado: +{quantity:.2f} a {product[1]}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Error agregando stock: {e}")
+
+    def configure_exchange_rate(self):
+        """Configura la tasa de cambio"""
+        current_rate = self.exchange_manager.get_rate()
+        
+        rate, ok = QInputDialog.getDouble(
+            self, 
+            "Configurar Tasa de Cambio", 
+            f"Tasa actual: {current_rate:.2f} Bs/$\n\nNueva tasa:", 
+            current_rate, 
+            0.01, 
+            999999.99, 
+            2
+        )
+        
+        if ok and rate != current_rate:
+            self.exchange_manager.set_rate(rate)
+            self.update_exchange_rate_display()
+            self.status_label.setText(f"Tasa de cambio actualizada: {rate:.2f} Bs/$")
+
+    def configure_shortcuts(self):
+        """Configura los atajos de teclado"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Atajos de Teclado")
+        dialog.setFixedSize(400, 300)
+        dialog.setStyleSheet(self.style_manager.get_dialog_style())
+        
+        layout = QVBoxLayout()
+        
+        # Título
+        title = QLabel("Atajos de Teclado")
+        title.setStyleSheet(self.style_manager.get_label_style("title"))
+        title.setFont(self.style_manager.fonts['subtitle'])
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        # Lista de atajos
+        shortcuts_text = QTextEdit()
+        shortcuts_text.setStyleSheet(self.style_manager.get_input_style())
+        shortcuts_text.setReadOnly(True)
+        
+        shortcuts_info = []
+        shortcuts_info.append("ATAJOS DE TECLADO DISPONIBLES:")
+        shortcuts_info.append("")
+        for action, shortcut in self.shortcuts.items():
+            action_name = {
+                "new_sale": "Nueva Venta / Limpiar Carrito",
+                "process_sale": "Procesar Venta",
+                "add_product": "Agregar Producto",
+                "search": "Buscar Productos",
+                "daily_report": "Cerrar Caja del Día"
+            }.get(action, action)
+            shortcuts_info.append(f"{action_name}: {shortcut}")
+        
+        shortcuts_text.setPlainText("\n".join(shortcuts_info))
+        layout.addWidget(shortcuts_text)
+        
+        # Botón cerrar
+        close_btn = QPushButton("Cerrar")
+        close_btn.setStyleSheet(self.style_manager.get_button_style())
+        close_btn.clicked.connect(dialog.close)
+        layout.addWidget(close_btn)
+        
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def show_sales_history(self):
+        """Muestra el historial de ventas"""
+        dialog = SalesHistoryDialog(self, self.db_manager)
+        dialog.exec_()
+
+    def show_inventory_report(self):
+        """Muestra el reporte de inventario"""
+        dialog = InventoryReportDialog(self, self.db_manager, self.exchange_manager.get_rate())
+        dialog.exec_()
+
+    def show_daily_report(self):
+        """Muestra el reporte diario"""
+        dialog = DailyReportDialog(self, self.db_manager, self.exchange_manager.get_rate())
+        dialog.exec_()
+
+    def create_backup(self):
+        """Crea un backup de la base de datos"""
+        try:
+            backup_filename = f"backup_pos_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            
+            # Copiar archivo de base de datos
+            import shutil
+            shutil.copy2(self.db_manager.db_file, backup_filename)
+            
+            QMessageBox.information(
+                self, 
+                "Backup Creado", 
+                f"Backup creado exitosamente:\n{backup_filename}"
+            )
+            
+            self.status_label.setText(f"Backup creado: {backup_filename}")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Error creando backup: {e}")
+
+    def show_about(self):
+        """Muestra información sobre la aplicación"""
+        about_text = """
+        <h2>Sistema POS - Punto de Venta</h2>
+        <p><b>Versión:</b> 1.0.0</p>
+        <p><b>Desarrollado por:</b> Tu Nombre</p>
+        <p><b>Descripción:</b> Sistema completo de punto de venta con gestión de inventario, 
+        ventas, reportes y múltiples métodos de pago.</p>
+        
+        <h3>Características:</h3>
+        <ul>
+        <li>Gestión completa de productos e inventario</li>
+        <li>Procesamiento de ventas con múltiples métodos de pago</li>
+        <li>Soporte para moneda dual (USD/BS)</li>
+        <li>Generación de tickets y reportes</li>
+        <li>Cierre de caja diario</li>
+        <li>Atajos de teclado personalizables</li>
+        <li>Interfaz moderna y fácil de usar</li>
+        </ul>
+        
+        <p><b>Tecnologías utilizadas:</b> Python, PyQt5, SQLite, ReportLab</p>
+        """
+        
+        QMessageBox.about(self, "Acerca de Sistema POS", about_text)
+
+    def closeEvent(self, event):
+        """Maneja el evento de cierre de la aplicación"""
+        if self.cart_items:
+            reply = QMessageBox.question(
+                self, 
+                "Confirmar Salida", 
+                "Hay productos en el carrito. ¿Desea salir sin procesar la venta?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
+        
+        # Cerrar conexiones y limpiar recursos
+        if hasattr(self, 'db_manager'):
+            self.db_manager.close()
+        
+        event.accept()
+
+def main():
+    """Función principal"""
+    app = QApplication(sys.argv)
+    
+    # Configurar aplicación
+    app.setApplicationName("Sistema POS")
+    app.setApplicationVersion("1.0.0")
+    app.setOrganizationName("Tu Empresa")
+    
+    # Aplicar estilo global
+    app.setStyle('Fusion')
+    
+    # Crear y mostrar ventana principal
+    window = POSMainWindow()
+    window.show()
+    
+    # Ejecutar aplicación
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
